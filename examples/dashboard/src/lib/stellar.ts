@@ -14,6 +14,7 @@ import {
 } from "@stellar/stellar-sdk";
 import {
   getAddress,
+  getNetwork,
   isConnected,
   requestAccess,
   signTransaction,
@@ -185,6 +186,37 @@ export async function ensureConnected(): Promise<string> {
   }
   const { address } = await getAddress();
   return address;
+}
+
+/**
+ * Non-prompting wallet check for restoring a persisted session on load.
+ * Never calls requestAccess(), so it cannot trigger a Freighter popup.
+ * Returns the connected address, or null if the wallet is unavailable.
+ */
+export async function checkWalletConnection(): Promise<string | null> {
+  try {
+    const { isConnected: connected } = await isConnected();
+    if (!connected) return null;
+    const { address, error } = await getAddress();
+    if (error || !address) return null;
+    return address;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Non-prompting network check: compares the wallet's active network
+ * passphrase against the one this app is configured for.
+ */
+export async function checkWalletNetwork(): Promise<boolean> {
+  try {
+    const { networkPassphrase, error } = await getNetwork();
+    if (error || !networkPassphrase) return false;
+    return networkPassphrase === NETWORK_PASSPHRASE;
+  } catch {
+    return false;
+  }
 }
 
 /** Format a base-unit amount for a 7-decimal Stellar asset. */
