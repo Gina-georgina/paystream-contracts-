@@ -91,6 +91,28 @@ Applies only to streams created afterwards; existing streams are unaffected.
 
 Use admin batch expiry when streams have crossed `stop_time + GRACE_PERIOD` and the employee has already exhausted any remaining claimable balance. The admin nonce is consumed even if no streams are eligible.
 
+### 3.1 Keeper pre-check with `is_stream_expirable`
+
+Before building a batch, query `is_stream_expirable` for each candidate. It is read-only (no nonce, no auth) and returns a tuple of `(eligible: bool, seconds_until_eligible: u64)`. When `eligible` is `true`, `seconds_until_eligible` is `0`; otherwise it is the number of seconds remaining until the stream crosses `stop_time + GRACE_PERIOD`. This lets keepers skip streams that would be silently ignored and avoid wasted admin calls.
+
+```bash
+# Read-only: no nonce required
+stellar contract invoke --id "$STREAM_ID" --source "$ADMIN" --network "$NETWORK" \
+  -- is_stream_expirable --stream_id 1
+# => [true, 0]        stream is eligible now
+# => [false, 3600]    eligible in 3600 seconds
+```
+
+Keeper loop:
+
+1. For each tracked stream, call `is_stream_expirable`.
+2. Collect IDs where `eligible == true` into a batch.
+3. If the batch is empty, do nothing — no nonce is consumed.
+4. Otherwise re-read the nonce and run `expire_streams` (below).
+5. For ineligible streams, schedule the next check at `now + seconds_until_eligible`.
+
+### 3.2 Batch expiry
+
 ```bash
 # Re-read the nonce before the admin batch
 export NONCE=$(stellar contract invoke --id "$STREAM_ID" --source "$ADMIN" --network "$NETWORK" -- admin_nonce)
@@ -100,6 +122,20 @@ stellar contract invoke --id "$STREAM_ID" --source "$ADMIN" --network "$NETWORK"
 ```
 
 Eligible streams are transitioned to `Exhausted`; ineligible IDs are silently skipped. This keeps off-chain indexes accurate without reverting the whole batch.
+
+## 3a. Migrate indexes for legacy streams
+
+After an upgrade that introduces new indexes, streams created before the upgrade have no index entries. Run the idempotent `migrate` step to backfill them. It is gated by a stored version: once the current version has been applied, further calls are no-ops, so it is safe to run twice.
+
+```bash
+# Re-read the nonce before the admin call
+export NONCE=$(stellar contract invoke --id "$STREAM_ID" --source "$ADMIN" --network "$NETWORK" -- admin_nonce)
+
+stellar contract invoke --id "$STREAM_ID" --source "$ADMIN" --network "$NETWORK" \
+  -- migrate --admin "$ADMIN_ADDRESS" --nonce "$NONCE"
+```
+
+Each call processes a bounded number of legacy streams and emits a progress event; repeat the call (re-reading the nonce each time) until the progress event reports completion. Verify with the index queries in the [API reference](api-reference.md).
 
 ## 4. Admin transfer
 

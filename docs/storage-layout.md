@@ -54,6 +54,10 @@ Every `DataKey` variant in `contracts/stream/src/types.rs`, in declaration order
 | `CreateCountThisLedger(Address)` | `u32` | Temporary | 2 ledgers | `check_and_increment_create_rate` | Rate limiter |
 | `LastCreateLedger(Address)` | `u32` | Temporary | 2 ledgers | `check_and_increment_create_rate` | Rate limiter |
 | `SplitBeneficiaries(u64)` | `Vec<SplitBeneficiary>` | Persistent | Extended on read/write (1y → 2y) | Split stream creation (PROD-22) | Split withdrawals |
+| `ContractEventVersion` | `u32` | Instance | Instance | `initialize`, `migrate` (SC-90) | `contract_event_version`; indexers stamp event schemas |
+| `EmployerTokenStreams(Address, Address)` | `Vec<u64>` | Persistent | Extended on read/write (1y → 2y) | `create_stream`, `transfer_stream` (SC-110) | `get_streams_by_employer_and_token` |
+| `MigrateCursor` | `u64` | Instance | Instance | `migrate` (SC-94, bounded backfill progress) | `migrate` (resume point) |
+| `MigrateVersion` | `u32` | Instance | Instance | `migrate` (SC-94, last completed backfill version) | `migrate` (idempotency gate) |
 
 > **Keep this table current.** Any PR that adds, removes, or changes a `DataKey` variant must update this table in the same PR (reviewers: check this).
 

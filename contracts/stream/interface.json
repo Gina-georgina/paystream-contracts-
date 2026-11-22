@@ -1,6 +1,84 @@
 {
   "_comment": "Baseline interface spec for the stream contract. Regenerate with scripts/check-interface.sh --update after intentional public interface changes.",
   "contract": "stream",
-  "functions": [],
-  "events": []
+  "functions": [
+    {
+      "name": "initialize",
+      "params": [],
+      "returns": "void"
+    },
+    {
+      "name": "migrate",
+      "params": [
+        {
+          "name": "limit",
+          "type": "u32"
+        }
+      ],
+      "returns": "u32"
+    },
+    {
+      "name": "is_stream_expirable",
+      "params": [
+        {
+          "name": "stream_id",
+          "type": "u64"
+        }
+      ],
+      "returns": {
+        "eligible": "bool",
+        "seconds_until_eligible": "u64"
+      }
+    },
+    {
+      "name": "get_streams_by_employer_and_token",
+      "params": [
+        {
+          "name": "employer",
+          "type": "Address"
+        },
+        {
+          "name": "token",
+          "type": "Address"
+        },
+        {
+          "name": "start",
+          "type": "u32"
+        },
+        {
+          "name": "limit",
+          "type": "u32"
+        }
+      ],
+      "returns": "Vec<u64>"
+    },
+    {
+      "name": "contract_event_version",
+      "params": [],
+      "returns": "u32"
+    }
+  ],
+  "events": [
+    {
+      "name": "contract_event_version_set",
+      "topics": [
+        "version"
+      ],
+      "data": {
+        "version": "u32"
+      }
+    },
+    {
+      "name": "migrate_progress",
+      "topics": [
+        "from_version",
+        "to_version"
+      ],
+      "data": {
+        "processed": "u32",
+        "remaining": "u32",
+        "done": "bool"
+      }
+    }
+  ]
 }

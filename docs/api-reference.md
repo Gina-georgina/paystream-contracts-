@@ -1367,7 +1367,9 @@ Admin upgrades the contract WASM in-place.
 
 ### `migrate`
 
-Migration hook called by the admin after an upgrade to confirm the new WASM is operational. Also writes the compile-time `CONTRACT_VERSION` constant (`1` as of the current release) into instance storage so that `version()` can be queried off-chain.
+Migration hook called by the admin after an upgrade to confirm the new WASM is operational. Also writes the compile-time `CONTRACT_VERSION` constant (`1` as of the current release) into instance storage so that `version()` can be queried off-chain, and stamps the contract event schema version so indexers can detect future event-schema changes without a resync.
+
+The migrate step also backfills any indexes introduced by newer releases (for example the employer/token and token indexes) for streams created before those indexes existed. The backfill is **idempotent** — calling `migrate` twice is safe and performs no duplicate work — and is **bounded per call**: each invocation processes at most `MAX_MIGRATE_BATCH` (50) legacy streams and emits a `migrate_progress` event with the number of streams processed and the remaining count so the admin can call it repeatedly until `remaining == 0`.
 
 **Caller:** Admin
 
@@ -1379,11 +1381,83 @@ Migration hook called by the admin after an upgrade to confirm the new WASM is o
 
 **Side effects:**
 - Writes `CONTRACT_VERSION` to `DataKey::Version` in instance storage.
+- Writes the contract event schema version (`CONTRACT_EVENT_VERSION`) to `DataKey::EventVersion` in instance storage.
+- Backfills missing index entries for up to 50 legacy streams and emits `migrate_progress(processed, remaining)`.
+
+**Errors:**
+- Panics if `admin` auth fails or does not match the stored admin
 
 **Example:**
 ```bash
 stellar contract invoke --id <STREAM_ID> --source <ADMIN_KEY> --network testnet \
   -- migrate --admin <ADMIN_ADDRESS>
+```
+
+---
+
+### `contract_event_version`
+
+Return the contract event schema version stamped by `initialize` / `migrate`. Indexers read this once at startup to know which event schema to decode; the value is stable for a given release and only changes when the event payloads change. See [events-schema.md](events-schema.md#event-versioning) for the version history.
+
+**Caller:** Anyone
+
+**Returns:** `u32` — current event schema version (`1` as of the current release)
+
+**Errors:** None (returns `0` if `initialize` / `migrate` has never been called)
+
+**Example:**
+```bash
+stellar contract invoke --id <STREAM_ID> --source <ANY_KEY> --network testnet \
+  -- contract_event_version
+```
+
+---
+
+### `is_stream_expirable`
+
+Read-only query returning whether a stream is currently eligible for `expire_streams`, so keepers can avoid wasted calls. A stream is eligible when it is `Active`, has `stop_time > 0`, `now > stop_time + GRACE_PERIOD`, and `claimable == 0`.
+
+**Caller:** Anyone
+
+| Parameter | Type | Description |
+|---|---|---|
+| `stream_id` | `u64` | ID of the stream to check |
+
+**Returns:** `(bool, u64)` — `(eligible, seconds_until_eligible)`. `eligible` is `true` when the stream can be expired now; `seconds_until_eligible` is `0` when eligible and otherwise the number of seconds remaining until the grace period elapses (`0` for streams that can never expire, e.g. no `stop_time` or already terminal).
+
+**Errors:**
+- Panics if stream not found
+
+**Example:**
+```bash
+stellar contract invoke --id <STREAM_ID> --source <KEEPER_KEY> --network testnet \
+  -- is_stream_expirable --stream_id 1
+```
+
+---
+
+### `get_streams_by_employer_and_token`
+
+Return a page of stream IDs owned by an employer and funded with a given token, intersecting the employer and token indexes. Read-only and bounded: the requested limit is capped at 50; an offset at or beyond the intersection size returns an empty vector.
+
+**Caller:** Anyone
+
+| Parameter | Type | Description |
+|---|---|---|
+| `employer` | `Address` | Employer address to query |
+| `token` | `Address` | Token contract address to filter by |
+| `offset` | `u32` | Number of matching stream IDs to skip |
+| `limit` | `u32` | Maximum number of IDs to return (capped at 50) |
+
+**Returns:** `Vec<u64>` — stream ID page, in creation order
+
+**Errors:** None (returns an empty vector when the employer has no streams for the token)
+
+**Example:**
+```bash
+stellar contract invoke --id <STREAM_ID> --source <ANY_KEY> --network testnet \
+  -- get_streams_by_employer_and_token \
+  --employer <EMPLOYER_ADDRESS> --token <TOKEN_ADDRESS> --offset 0 --limit 20
 ```
 
 ---
@@ -1914,6 +1988,20 @@ Emitted by `withdraw` when the stream's remaining deposit (`deposit - withdrawn`
 
 **Topics:** `("low_bal", stream_id)`
 **Data:** `(employer, remaining, threshold)`
+
+---
+
+### `migrate_progress`
+
+Emitted by `migrate` after each bounded backfill batch so the admin can track progress across repeated calls.
+
+| Field | Type | Description |
+|---|---|---|
+| `processed` | `u32` | Number of legacy streams backfilled in this call |
+| `remaining` | `u32` | Number of legacy streams still awaiting backfill (`0` when complete) |
+
+**Topics:** `("v1", "mig_prog")`
+**Data:** `(processed, remaining)`
 
 ---
 

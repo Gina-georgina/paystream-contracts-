@@ -15,6 +15,15 @@ Each entry lists the event, the change (added field / renamed topic / removed fi
 | `init`, `created`, `withdraw`, `status`, `cancelled`, `topup`, `paused`, `rate_upd`, `stop_upd`, `near_exp`, `exp_unres`, `upg_prop`, `upg_exec`, `upg_cncl`, `at_set`, `at_up`, `thresh_up`, `split`, `p_stats` | Baseline: topic prefixed with `"v1"` | None. Match on `topic[0] == "v1"`, then `topic[1]` |
 | `receipt`, `archived`, `expired`, `xfr_strm`, `low_bal` | Baseline: emitted **without** a version prefix | Match on `topic[0]` directly. A future version will add the `"v1"` prefix and list it here |
 
+### v1.1 (2026-10-01) — event version stamp & migrate progress
+
+| Event | Change | Migration |
+|-------|--------|-----------|
+| `contract_event_version` (instance storage) | Added: instance value holding the contract event schema version (`u32`, currently `1`). Written on `initialize` and on `migrate` | Read once via `get_contract_event_version` (or the instance ledger entry) at indexer startup; no resync needed. Absent on contracts deployed before v1.1 — treat as `1` |
+| `evt_ver` | Added: emitted on `initialize`/`migrate` with the stamped version | Optional. Use to detect version bumps without polling instance storage |
+| `mig_prog` | Added: emitted by `migrate` with backfill progress (`done`, `total`) | Optional. Use to track legacy-stream backfill; no schema change to existing events |
+=======
+
 <!-- Template for new entries:
 ### vX.Y (YYYY-MM-DD)
 | Event | Change | Migration |
@@ -27,6 +36,19 @@ Each entry lists the event, the change (added field / renamed topic / removed fi
 Current schema version: **v1**
 
 All event topics include the schema version as the first component to enable version detection and compatibility handling.
+
+### Contract Event Version (instance value)
+
+In addition to the per-topic prefix, the contract stores a **contract event version** as an instance value under the key `contract_event_version` (`u32`). It is set on `initialize` and re-stamped on `migrate`, so indexers can read the current schema version directly from contract state without replaying history or resyncing.
+
+- **Key**: `contract_event_version` (instance storage)
+- **Type**: `u32`
+- **Current value**: `1`
+- **Written by**: `initialize`, `migrate`
+- **Read by indexers**: via the `get_contract_event_version` view, or by reading the instance ledger entry
+- **Legacy contracts**: if the value is absent (deployed before this stamp), assume `1`
+
+When the event schema changes in a breaking way, this value is bumped together with the topic prefix (e.g. `"v2"`), and the change is recorded in the changelog above.
 
 ## Event Format
 
@@ -318,6 +340,45 @@ Emitted when a pending contract upgrade is cancelled.
 }
 ```
 
+---
+
+### event_version_stamped
+
+Emitted when the contract event version is stamped on `initialize` or re-stamped on `migrate`.
+
+**Topic**: `["v1", "evt_ver"]`
+
+**Data**:
+- `version` (u32): The contract event version now stored in instance storage
+
+**Example**:
+```json
+{
+  "topic": ["v1", "evt_ver"],
+  "data": [1]
+}
+```
+
+---
+
+### migrate_progress
+
+Emitted by `migrate` while backfilling indexes for legacy streams. Bounded per call; emitted once per invocation with the progress after that call.
+
+**Topic**: `["v1", "mig_prog"]`
+
+**Data**:
+- `done` (u32): Number of legacy streams backfilled so far
+- `total` (u32): Total number of legacy streams to backfill
+
+**Example**:
+```json
+{
+  "topic": ["v1", "mig_prog"],
+  "data": [50, 200]
+}
+```
+
 ## Type Reference
 
 | Type | Description | Example |
@@ -389,6 +450,7 @@ function parseV1Event(topic, data) {
 | Version | Date | Changes |
 |---------|------|---------|
 | v1 | 2026-09-27 | Initial schema version |
+| v1.1 | 2026-10-01 | Added `contract_event_version` instance value (stamped on `initialize`/`migrate`), `evt_ver` and `mig_prog` events. No change to existing event topics or data |
 
 ## Testing
 

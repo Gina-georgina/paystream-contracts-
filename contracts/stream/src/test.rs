@@ -5212,3 +5212,283 @@ fn test_template_save_requires_employer_auth() {
     let res = client.try_save_template(&employer, &1, &template_params(&env, &token, None));
     assert!(res.is_err(), "save_template must require the employer's auth");
 }
+
+// ---------------------------------------------------------------------------
+// SC-90 – contract event version stamp
+// ---------------------------------------------------------------------------
+
+/// initialize must stamp the contract event version so indexers can detect
+/// the event schema without a resync.
+#[test]
+fn test_contract_event_version_set_on_initialize() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+
+    client.initialize(&admin);
+
+    let version = client.contract_event_version();
+    assert_eq!(version, crate::EVENT_VERSION);
+    assert!(version >= 1, "event version must be a positive stamp");
+}
+
+/// migrate must (re)stamp the contract event version, even when the version
+/// was never written (legacy deployment).
+#[test]
+fn test_contract_event_version_set_on_migrate() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+
+    client.initialize(&admin);
+    client.migrate(&admin, &0, &10);
+
+    assert_eq!(client.contract_event_version(), crate::EVENT_VERSION);
+}
+
+// ---------------------------------------------------------------------------
+// SC-94 – migrate hook backfills indexes for legacy streams
+// ---------------------------------------------------------------------------
+
+/// Build a fixture of legacy streams: streams created through the normal path
+/// but with the composite (employer, token) index entries removed, emulating
+/// streams written before the index existed.
+fn legacy_stream_fixture(
+    env: &Env,
+    client: &StreamContractClient,
+    count: u32,
+) -> (Address, Address, soroban_sdk::Vec<u64>) {
+    let admin = Address::generate(env);
+    let employer = Address::generate(env);
+    let token_id = setup_token(env, &employer);
+
+    client.initialize(&admin);
+    let mut ids = soroban_sdk::Vec::new(env);
+    for _ in 0..count {
+        let employee = Address::generate(env);
+        let id = client.create_stream(
+            &employer,
+            &employee,
+            &token_id,
+            &10_000,
+            &10,
+            &0,
+            &None,
+            &None,
+        );
+        ids.push_back(id);
+    }
+
+    // Strip the composite index to emulate a pre-index (legacy) stream set.
+    env.as_contract(&client.address, || {
+        for id in ids.iter() {
+            storage::remove_stream_from_employer_token_index(env, &employer, &token_id, id);
+        }
+    });
+    assert_eq!(client.stream_count_by_employer_and_token(&employer, &token_id), 0);
+
+    (employer, token_id, ids)
+}
+
+/// migrate backfills the composite index for legacy streams.
+#[test]
+fn test_migrate_backfills_legacy_stream_indexes() {
+    let (env, client) = setup();
+    let (employer, token_id, ids) = legacy_stream_fixture(&env, &client, 3);
+    let admin = Address::generate(&env);
+
+    let migrated = client.migrate(&admin, &0, &10);
+    assert_eq!(migrated, 3, "all legacy streams must be backfilled");
+
+    let indexed = client.stream_ids_by_employer_and_token(&employer, &token_id, &0, &50);
+    assert_eq!(indexed.len(), ids.len());
+    for id in ids.iter() {
+        assert!(indexed.contains(id));
+    }
+}
+
+/// migrate is idempotent: a second call is a no-op and does not duplicate
+/// index entries.
+#[test]
+fn test_migrate_is_idempotent() {
+    let (env, client) = setup();
+    let (employer, token_id, ids) = legacy_stream_fixture(&env, &client, 4);
+    let admin = Address::generate(&env);
+
+    let first = client.migrate(&admin, &0, &10);
+    assert_eq!(first, 4);
+
+    let second = client.migrate(&admin, &0, &10);
+    assert_eq!(second, 0, "second migrate must not re-process streams");
+
+    let indexed = client.stream_ids_by_employer_and_token(&employer, &token_id, &0, &50);
+    assert_eq!(indexed.len(), ids.len(), "index entries must not duplicate");
+}
+
+/// migrate is bounded per call and reports progress via an event.
+#[test]
+fn test_migrate_is_bounded_and_emits_progress() {
+    use soroban_sdk::{symbol_short, vec, IntoVal};
+
+    let (env, client) = setup();
+    let (_employer, _token_id, _ids) = legacy_stream_fixture(&env, &client, 5);
+    let admin = Address::generate(&env);
+
+    let migrated = client.migrate(&admin, &0, &2);
+    assert_eq!(migrated, 2, "migrate must honour the per-call bound");
+
+    let progress_topics = vec![
+        &env,
+        symbol_short!("v1").into_val(&env),
+        symbol_short!("migrate").into_val(&env),
+    ];
+    let events = crate::test::all_events(&env);
+    assert!(
+        events.iter().any(|(_, topics, _)| *topics == progress_topics),
+        "migrate must emit a progress event"
+    );
+
+    // Remaining streams are processed by subsequent bounded calls.
+    assert_eq!(client.migrate(&admin, &0, &2), 2);
+    assert_eq!(client.migrate(&admin, &0, &2), 1);
+    assert_eq!(client.migrate(&admin, &0, &2), 0);
+}
+
+// ---------------------------------------------------------------------------
+// SC-101 – is_stream_expirable grace-period query
+// ---------------------------------------------------------------------------
+
+/// is_stream_expirable returns (false, seconds_until_eligible) before the
+/// grace period elapses.
+#[test]
+fn test_is_stream_expirable_before_grace_period() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let id = client.create_stream(&employer, &employee, &token_id, &10_000, &10, &1_100, &None, &None);
+
+    // Exactly at stop_time: grace period has not started elapsing.
+    env.ledger().with_mut(|l| l.timestamp = 1_100);
+    let (eligible, seconds_until) = client.is_stream_expirable(&id);
+    assert!(!eligible);
+    assert_eq!(seconds_until, crate::GRACE_PERIOD);
+
+    // One second before stop_time + GRACE_PERIOD.
+    env.ledger().with_mut(|l| l.timestamp = 1_100 + crate::GRACE_PERIOD - 1);
+    let (eligible, seconds_until) = client.is_stream_expirable(&id);
+    assert!(!eligible);
+    assert_eq!(seconds_until, 1);
+}
+
+/// is_stream_expirable returns (true, 0) exactly at stop_time + GRACE_PERIOD.
+#[test]
+fn test_is_stream_expirable_at_grace_boundary() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let id = client.create_stream(&employer, &employee, &token_id, &10_000, &10, &1_100, &None, &None);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_100 + crate::GRACE_PERIOD);
+    let (eligible, seconds_until) = client.is_stream_expirable(&id);
+    assert!(eligible, "stream is eligible exactly at the grace boundary");
+    assert_eq!(seconds_until, 0);
+
+    // Just after the boundary it stays eligible.
+    env.ledger().with_mut(|l| l.timestamp = 1_100 + crate::GRACE_PERIOD + 1);
+    let (eligible, seconds_until) = client.is_stream_expirable(&id);
+    assert!(eligible);
+    assert_eq!(seconds_until, 0);
+}
+
+/// is_stream_expirable is read-only: it must not mutate the stream.
+#[test]
+fn test_is_stream_expirable_is_read_only() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let id = client.create_stream(&employer, &employee, &token_id, &10_000, &10, &1_100, &None, &None);
+    let before = client.get_stream(&id);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_100 + crate::GRACE_PERIOD);
+    let _ = client.is_stream_expirable(&id);
+
+    let after = client.get_stream(&id);
+    assert_eq!(before.status, after.status);
+    assert_eq!(before.withdrawn, after.withdrawn);
+    assert_eq!(before.last_withdraw_time, after.last_withdraw_time);
+}
+
+// ---------------------------------------------------------------------------
+// SC-110 – get_streams_by_employer_and_token
+// ---------------------------------------------------------------------------
+
+/// Snapshot: the per-token employer view intersects both indexes, keeps
+/// creation order and paginates with a capped limit.
+#[test]
+fn test_get_streams_by_employer_and_token_snapshot() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let other_employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_a = setup_token(&env, &employer);
+    let token_b = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    let a1 = client.create_stream(&employer, &employee, &token_a, &10_000, &10, &0, &None, &None);
+    let b1 = client.create_stream(&employer, &employee, &token_b, &10_000, &10, &0, &None, &None);
+    let a2 = client.create_stream(&employer, &employee, &token_a, &10_000, &10, &0, &None, &None);
+    let a3 = client.create_stream(&employer, &employee, &token_a, &10_000, &10, &0, &None, &None);
+    // A stream owned by a different employer must never appear.
+    let _other = client.create_stream(&other_employer, &employee, &token_a, &10_000, &10, &0, &None, &None);
+
+    let all_a = client.get_streams_by_employer_and_token(&employer, &token_a, &0, &50);
+    assert_eq!(all_a.len(), 3);
+    assert_eq!(all_a.get(0).unwrap(), a1);
+    assert_eq!(all_a.get(1).unwrap(), a2);
+    assert_eq!(all_a.get(2).unwrap(), a3);
+
+    let all_b = client.get_streams_by_employer_and_token(&employer, &token_b, &0, &50);
+    assert_eq!(all_b.len(), 1);
+    assert_eq!(all_b.get(0).unwrap(), b1);
+
+    // Pagination.
+    let page = client.get_streams_by_employer_and_token(&employer, &token_a, &1, &1);
+    assert_eq!(page.len(), 1);
+    assert_eq!(page.get(0).unwrap(), a2);
+
+    let beyond = client.get_streams_by_employer_and_token(&employer, &token_a, &10, &50);
+    assert!(beyond.is_empty());
+
+    // Limit is capped.
+    let capped = client.get_streams_by_employer_and_token(&employer, &token_a, &0, &100);
+    assert_eq!(capped.len(), 3);
+}
+
+/// get_streams_by_employer_and_token is read-only and returns empty for an
+/// unknown token.
+#[test]
+fn test_get_streams_by_employer_and_token_unknown_token_empty() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let unknown_token = Address::generate(&env);
+
+    client.initialize(&admin);
+    assert!(client
+        .get_streams_by_employer_and_token(&employer, &unknown_token, &0, &50)
+        .is_empty());
+}

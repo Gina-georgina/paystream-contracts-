@@ -28,6 +28,46 @@ use soroban_sdk::{contract, contractimpl, token, Address, BytesN, Env, Map, Symb
 /// WASM upgrade so that `migrate` stamps the new version into instance
 /// storage and `version()` can be queried off-chain.
 pub const CONTRACT_VERSION: u32 = 1;
+
+/// Version stamp for the emitted event schema (SC-90).
+///
+/// Indexers read this value (via [`StreamContract::contract_event_version`])
+/// to detect which event schema the running WASM emits, so a future schema
+/// change can be handled without a full resync. Bump this constant whenever
+/// the shape of any emitted event changes.
+pub const CONTRACT_EVENT_VERSION: u32 = 1;
+
+/// Maximum number of streams backfilled per `migrate` call (SC-94).
+pub const MIGRATE_BATCH_SIZE: u32 = 50;
+
+/// Maximum page size returned by `get_streams_by_employer_and_token` (SC-110).
+pub const MAX_QUERY_PAGE_SIZE: u32 = 50;
+
+fn get_contract_event_version(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::ContractEventVersion)
+        .unwrap_or(0)
+}
+
+fn set_contract_event_version(env: &Env, version: u32) {
+    env.storage()
+        .instance()
+        .set(&DataKey::ContractEventVersion, &version);
+}
+
+fn get_migrate_version(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::MigrateVersion)
+        .unwrap_or(0)
+}
+
+fn set_migrate_version(env: &Env, version: u32) {
+    env.storage()
+        .instance()
+        .set(&DataKey::MigrateVersion, &version);
+}
 use storage::{
     set_protocol_fee,
     check_and_increment_create_rate, get_stream_ended_at, load_stream_any, set_split_beneficiaries,
@@ -42,6 +82,7 @@ use storage::{
     remove_employer_stream, save_stream, save_template, set_admin, set_auto_topup, set_min_deposit,
     set_pending_admin, set_pending_admin_nonce, set_pending_upgrade, set_receipt_owner,
     set_stream_cliff, stream_ids_by_employee, stream_ids_by_employer, TIMELOCK_DELAY,
+    index_employer_token_stream, get_employer_token_streams, remove_employer_token_stream,
 };
 use types::{
     AutoTopupConfig, PendingUpgrade, SplitBeneficiary,
@@ -164,7 +205,9 @@ impl StreamContract {
         );
         admin.require_auth();
         set_admin(&env, &admin);
+        set_contract_event_version(&env, CONTRACT_EVENT_VERSION);
         events::contract_initialized(&env, &admin);
+        events::contract_event_version_set(&env, CONTRACT_EVENT_VERSION);
     }
 
     /// Step 1 of two-step admin transfer: current admin proposes a new admin.
@@ -421,6 +464,7 @@ impl StreamContract {
         index_employer_stream(&env, &employer, id);
         index_employee_stream(&env, &employee, id);
         index_token_stream(&env, &stream.token, id);
+        index_employer_token_stream(&env, &employer, &stream.token, id);
         index_stream_by_timestamp(&env, now, id);
         events::stream_created(&env, id, &employer, &employee, rate_per_second);
         id
@@ -502,6 +546,7 @@ impl StreamContract {
         index_employer_stream(&env, &employer, id);
         index_employee_stream(&env, &employee, id);
         index_token_stream(&env, &token_address, id);
+        index_employer_token_stream(&env, &employer, &token_address, id);
         index_stream_by_timestamp(&env, now, id);
         events::stream_created(&env, id, &employer, &employee, 0);
         id
@@ -646,6 +691,7 @@ impl StreamContract {
             index_employer_stream(&env, &employer, id);
             index_employee_stream(&env, &p.employee, id);
             index_token_stream(&env, &p.token, id);
+            index_employer_token_stream(&env, &employer, &p.token, id);
             index_stream_by_timestamp(&env, now, id);
             events::stream_created(&env, id, &employer, &p.employee, p.rate_per_second);
             ids.push_back(id);
@@ -745,6 +791,7 @@ impl StreamContract {
         set_split_beneficiaries(&env, stream_id, &beneficiaries);
         index_employer_stream(&env, &employer, stream_id);
         index_token_stream(&env, &token, stream_id);
+        index_employer_token_stream(&env, &employer, &token, stream_id);
         index_stream_by_timestamp(&env, now, stream_id);
 
         // Index all beneficiaries so they can query their streams
@@ -1589,6 +1636,9 @@ impl StreamContract {
         // Update EmployerStreams index: remove stream_id from old employer, add to new.
         remove_employer_stream(&env, &employer, stream_id);
         index_employer_stream(&env, &new_employer, stream_id);
+        // Keep the employer+token composite index consistent (SC-110).
+        remove_employer_token_stream(&env, &employer, &stream.token, stream_id);
+        index_employer_token_stream(&env, &new_employer, &stream.token, stream_id);
 
         // Update the stream record.
         stream.employer = new_employer.clone();
@@ -2204,12 +2254,20 @@ impl StreamContract {
         events::upgrade_cancelled(&env);
     }
 
-    /// No-op migration hook called by the admin after an upgrade.
+    /// Migration hook called by the admin after an upgrade.
     ///
-    /// Confirms the new WASM is operational and the admin key is still valid.
-    /// Also writes the compile-time [`CONTRACT_VERSION`] constant into instance
-    /// storage so that `version()` can be queried off-chain for upgrade
-    /// verification and version-gated feature flags.
+    /// Confirms the new WASM is operational and the admin key is still valid,
+    /// then stamps the compile-time [`CONTRACT_VERSION`] and
+    /// [`CONTRACT_EVENT_VERSION`] constants into instance storage so that
+    /// `version()` and `contract_event_version()` can be queried off-chain.
+    ///
+    /// It also performs a **version-gated, idempotent, bounded** backfill of
+    /// indexes added in later revisions (currently the employer+token composite
+    /// index, SC-110) for streams created before those indexes existed (SC-94).
+    /// Each call processes at most [`MIGRATE_BATCH_SIZE`] streams and emits a
+    /// `migrate_progress` event; once every stream has been backfilled the
+    /// stored migrate version is advanced and a `migrate_completed` event is
+    /// emitted. Calling `migrate` again after completion is a no-op backfill.
     ///
     /// # Parameters
     /// - `admin` — must match the stored admin (requires auth)
@@ -2227,6 +2285,43 @@ impl StreamContract {
         env.storage()
             .instance()
             .set(&DataKey::Version, &CONTRACT_VERSION);
+        set_contract_event_version(&env, CONTRACT_EVENT_VERSION);
+        events::contract_event_version_set(&env, CONTRACT_EVENT_VERSION);
+
+        // SC-94: backfill new indexes for legacy streams, bounded per call.
+        let total = env
+            .storage()
+            .instance()
+            .get(&DataKey::StreamCount)
+            .unwrap_or(0u64);
+        let mut cursor = get_migrate_version(&env) as u64;
+        if cursor >= total {
+            // Already fully migrated — idempotent no-op.
+            return;
+        }
+
+        let end = cursor.saturating_add(MIGRATE_BATCH_SIZE as u64).min(total);
+        while cursor < end {
+            let stream_id = cursor + 1;
+            if let Some(stream) = load_stream_any(&env, stream_id) {
+                index_employer_token_stream(&env, &stream.employer, &stream.token, stream_id);
+            }
+            cursor += 1;
+        }
+
+        set_migrate_version(&env, cursor as u32);
+        events::migrate_progress(&env, cursor, total);
+        if cursor >= total {
+            events::migrate_completed(&env, total);
+        }
+    }
+
+    /// Return the event schema version stamped by `initialize` / `migrate` (SC-90).
+    ///
+    /// Indexers use this to detect which event schema the running WASM emits
+    /// without resyncing. Returns `0` if the contract has not been initialised.
+    pub fn contract_event_version(env: Env) -> u32 {
+        get_contract_event_version(&env)
     }
 
     /// Return the contract version stored by the last `migrate` call.
@@ -2391,6 +2486,47 @@ impl StreamContract {
         get_paused(&env)
     }
 
+    /// Return whether a stream is currently eligible for [`expire_streams`],
+    /// plus the number of seconds until it becomes eligible (SC-101).
+    ///
+    /// Read-only; intended for keepers to avoid wasted `expire_streams` calls.
+    /// A stream is eligible when ALL of the following hold:
+    /// - `stop_time > 0`
+    /// - `now > stop_time + GRACE_PERIOD`
+    /// - stream status is `Active`
+    /// - `claimable == 0`
+    ///
+    /// When not yet eligible, the second tuple element is the number of seconds
+    /// remaining until the grace period elapses (`0` if already elapsed but the
+    /// stream is ineligible for another reason).
+    ///
+    /// # Parameters
+    /// - `stream_id` — ID of the stream to query
+    ///
+    /// # Returns
+    /// `(eligible, seconds_until_eligible)`.
+    ///
+    /// # Errors
+    /// - Panics if stream not found (E015)
+    pub fn is_stream_expirable(env: Env, stream_id: u64) -> (bool, u64) {
+        let stream = load_stream(&env, stream_id).expect(ERR_STREAM_NOT_FOUND);
+        if stream.stop_time == 0 {
+            return (false, 0);
+        }
+        let now = env.ledger().timestamp();
+        let eligible_at = stream.stop_time.saturating_add(GRACE_PERIOD);
+        if now <= eligible_at {
+            return (false, eligible_at.saturating_sub(now));
+        }
+        if stream.status != StreamStatus::Active {
+            return (false, 0);
+        }
+        if stream_claimable_amount(&env, &stream, now) > 0 {
+            return (false, 0);
+        }
+        (true, 0)
+    }
+
     /// Return whether a stream has expired and is eligible for cleanup.
     ///
     /// A stream is considered expired when ALL of the following hold:
@@ -2497,6 +2633,48 @@ impl StreamContract {
 
         let end = offset.saturating_add(limit.min(50));
         let mut position = 0u64;
+        for stream_id in stream_ids.iter() {
+            if position >= end {
+                break;
+            }
+            if position >= offset {
+                page.push_back(stream_id);
+            }
+            position += 1;
+        }
+        page
+    }
+
+    /// Return a page of stream IDs owned by `employer` and funded with `token`
+    /// (SC-110).
+    ///
+    /// Intersects the employer and token indexes. `limit` is capped at
+    /// [`MAX_QUERY_PAGE_SIZE`]. If `offset` is at or beyond the number of
+    /// matching streams, an empty vector is returned. Read-only.
+    ///
+    /// # Parameters
+    /// - `employer` — employer address to query
+    /// - `token` — token contract address to query
+    /// - `offset` — number of matching stream IDs to skip
+    /// - `limit` — maximum number of IDs to return (capped at 50)
+    ///
+    /// # Returns
+    /// `Vec<u64>` page of matching stream IDs in creation order.
+    pub fn get_streams_by_employer_and_token(
+        env: Env,
+        employer: Address,
+        token: Address,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<u64> {
+        let stream_ids = get_employer_token_streams(&env, &employer, &token);
+        let mut page: Vec<u64> = Vec::new(&env);
+        if offset >= stream_ids.len() {
+            return page;
+        }
+
+        let end = offset.saturating_add(limit.min(MAX_QUERY_PAGE_SIZE));
+        let mut position = 0u32;
         for stream_id in stream_ids.iter() {
             if position >= end {
                 break;

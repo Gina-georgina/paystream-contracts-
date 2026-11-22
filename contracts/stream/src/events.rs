@@ -226,3 +226,23 @@ pub fn max_creates_per_ledger_updated(env: &Env, max: u32) {
     env.events()
         .publish((symbol_short!("v1"), symbol_short!("rl_upd"),), max);
 }
+
+/// Emitted on initialize/migrate to stamp the contract event schema version
+/// (SC-90). Indexers can read this to detect future event schema changes
+/// without resyncing. Topics: `("v1", "ev_ver")`; data: the version number.
+pub fn contract_event_version_set(env: &Env, version: u32) {
+    env.events()
+        .publish((symbol_short!("v1"), symbol_short!("ev_ver")), version);
+}
+
+/// Emitted per bounded migrate batch to report backfill progress (SC-94).
+///
+/// - `processed` — number of legacy streams backfilled so far
+/// - `total`     — total number of legacy streams to backfill
+/// - `done`      — whether the migration has completed
+pub fn migrate_progress(env: &Env, processed: u32, total: u32, done: bool) {
+    env.events().publish(
+        (symbol_short!("v1"), symbol_short!("mig_prog")),
+        (processed, total, done),
+    );
+}

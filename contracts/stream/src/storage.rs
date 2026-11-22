@@ -49,6 +49,90 @@ pub fn assert_version_upgrade(env: &Env, new_version: u32) {
     }
 }
 
+/// Stores the contract event schema version in instance storage.
+pub fn set_contract_event_version(env: &Env, version: u32) {
+    env.storage()
+        .instance()
+        .set(&crate::DataKey::ContractEventVersion, &version);
+}
+
+/// Returns the contract event schema version, or 0 when never set.
+pub fn get_contract_event_version(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&crate::DataKey::ContractEventVersion)
+        .unwrap_or(0)
+}
+
+/// Appends `stream_id` to the composite employer+token index for `(employer, token)`.
+/// Idempotent: a stream already present in the index is not added again.
+pub fn index_employer_token_stream(
+    env: &Env,
+    employer: &Address,
+    token: &Address,
+    stream_id: u64,
+) {
+    let key = crate::DataKey::EmployerTokenStreams(employer.clone(), token.clone());
+    let mut ids: soroban_sdk::Vec<u64> = env.storage().persistent().get(&key).unwrap_or_else(|| {
+        soroban_sdk::Vec::new(env)
+    });
+    for existing in ids.iter() {
+        if existing == stream_id {
+            return;
+        }
+    }
+    ids.push_back(stream_id);
+    env.storage().persistent().set(&key, &ids);
+}
+
+/// Returns the stream ids indexed for `(employer, token)`, or an empty vector.
+pub fn get_employer_token_streams(
+    env: &Env,
+    employer: &Address,
+    token: &Address,
+) -> soroban_sdk::Vec<u64> {
+    let key = crate::DataKey::EmployerTokenStreams(employer.clone(), token.clone());
+    env.storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| soroban_sdk::Vec::new(env))
+}
+
+/// Returns the schema version the migrate backfill has completed up to (0 = never run).
+pub fn get_migrate_version(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&crate::DataKey::MigrateVersion)
+        .unwrap_or(0)
+}
+
+/// Records the schema version the migrate backfill has completed up to.
+pub fn set_migrate_version(env: &Env, version: u32) {
+    env.storage()
+        .instance()
+        .set(&crate::DataKey::MigrateVersion, &version);
+}
+
+/// Returns the resume cursor for a bounded migrate call (0 = start from beginning).
+pub fn get_migrate_cursor(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&crate::DataKey::MigrateCursor)
+        .unwrap_or(0)
+}
+
+/// Persists the resume cursor for a bounded migrate call.
+pub fn set_migrate_cursor(env: &Env, cursor: u64) {
+    env.storage()
+        .instance()
+        .set(&crate::DataKey::MigrateCursor, &cursor);
+}
+
+/// Clears the migrate cursor once a backfill pass has completed.
+pub fn clear_migrate_cursor(env: &Env) {
+    env.storage().instance().remove(&crate::DataKey::MigrateCursor);
+}
+
 #[cfg(test)]
 mod version_tests {
     use super::*;
