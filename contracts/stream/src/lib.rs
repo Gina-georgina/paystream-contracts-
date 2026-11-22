@@ -33,6 +33,8 @@ use storage::{
     check_and_increment_create_rate, get_stream_ended_at, load_stream_any, set_split_beneficiaries,
     ARCHIVE_WAIT_PERIOD, GRACE_PERIOD, SECONDS_PER_DAY, get_linear_vest_schedule, get_protocol_fee, get_stream_type, linear_vest_claimable_amount, set_linear_vest_schedule, set_stream_ended_at, set_max_creates_per_ledger as store_max_creates,
     get_employer_create_count, get_max_creates_per_ledger,
+    get_grace_period, get_archive_wait_period, set_grace_period as store_grace_period,
+    set_archive_wait_period as store_archive_wait_period,
     accrual_start, claimable_amount, clear_pending_admin, clear_pending_upgrade,
     consume_admin_nonce, delete_template, get_admin, get_admin_nonce, get_auto_topup,
     get_employee_streams, get_employer_streams, get_min_deposit, get_pending_admin,
@@ -293,6 +295,61 @@ impl StreamContract {
         assert!(max >= 1, "max must be at least 1");
         store_max_creates(&env, max);
         events::max_creates_per_ledger_updated(&env, max);
+    }
+
+    /// Set the admin-configurable grace period applied after a stream's
+    /// `stop_time` before it becomes eligible for expiry (SC-83).
+    ///
+    /// Bounded to [1 hour, 30 days] so protocol economics can be tuned
+    /// post-deploy without allowing a pathological value.
+    ///
+    /// # Parameters
+    /// - `admin` — must match the stored admin (requires auth)
+    /// - `nonce` — current admin nonce (replay protection)
+    /// - `secs` — new grace period in seconds
+    ///
+    /// # Errors
+    /// - Panics if `admin` auth fails or does not match stored admin
+    /// - E009 if `nonce` is wrong
+    /// - Panics if `secs` is outside the allowed bounds
+    pub fn set_grace_period(env: Env, admin: Address, nonce: u64, secs: u64) {
+        admin.require_auth();
+        let stored_admin = get_admin(&env);
+        assert_eq!(admin, stored_admin, "{}", ERR_NOT_ADMIN);
+        consume_admin_nonce(&env, nonce);
+        assert!(
+            (3_600..=2_592_000).contains(&secs),
+            "grace period must be between 1 hour and 30 days"
+        );
+        store_grace_period(&env, secs);
+        events::grace_period_updated(&env, secs);
+    }
+
+    /// Set the admin-configurable wait period required after a stream ends
+    /// before it may be archived (SC-83).
+    ///
+    /// Bounded to [1 hour, 90 days].
+    ///
+    /// # Parameters
+    /// - `admin` — must match the stored admin (requires auth)
+    /// - `nonce` — current admin nonce (replay protection)
+    /// - `secs` — new archive wait period in seconds
+    ///
+    /// # Errors
+    /// - Panics if `admin` auth fails or does not match stored admin
+    /// - E009 if `nonce` is wrong
+    /// - Panics if `secs` is outside the allowed bounds
+    pub fn set_archive_wait_period(env: Env, admin: Address, nonce: u64, secs: u64) {
+        admin.require_auth();
+        let stored_admin = get_admin(&env);
+        assert_eq!(admin, stored_admin, "{}", ERR_NOT_ADMIN);
+        consume_admin_nonce(&env, nonce);
+        assert!(
+            (3_600..=7_776_000).contains(&secs),
+            "archive wait period must be between 1 hour and 90 days"
+        );
+        store_archive_wait_period(&env, secs);
+        events::archive_wait_period_updated(&env, secs);
     }
 
     /// Set the protocol creation fee and its treasury destination.
@@ -1547,7 +1604,7 @@ impl StreamContract {
         let now = env.ledger().timestamp();
         let ended_at = get_stream_ended_at(&env, stream_id).unwrap_or(0);
         assert!(
-            ended_at > 0 && now >= ended_at.saturating_add(ARCHIVE_WAIT_PERIOD),
+            ended_at > 0 && now >= ended_at.saturating_add(get_archive_wait_period(&env)),
             "{}",
             ERR_ARCHIVE_TOO_EARLY
         );
@@ -1729,7 +1786,7 @@ impl StreamContract {
                 continue;
             }
             // 2. Grace period must have elapsed.
-            if now <= stream.stop_time.saturating_add(GRACE_PERIOD) {
+            if now <= stream.stop_time.saturating_add(get_grace_period(&env)) {
                 continue;
             }
             // 3. Must still be Active (Paused streams could have pending accrual).
@@ -2447,7 +2504,7 @@ impl StreamContract {
         let now = env.ledger().timestamp();
 
         // Grace period must have elapsed since stop_time.
-        if now < stream.stop_time.saturating_add(GRACE_PERIOD) {
+        if now < stream.stop_time.saturating_add(get_grace_period(&env)) {
             return false;
         }
 

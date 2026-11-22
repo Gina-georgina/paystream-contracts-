@@ -246,3 +246,15 @@ pub fn protocol_fee_updated(env: &Env, fee_bps: u32, treasury: &Address) {
         (fee_bps, treasury.clone()),
     );
 }
+
+/// Emitted when the admin updates the configurable grace period (SC-83).
+pub fn grace_period_updated(env: &Env, secs: u64) {
+    env.events()
+        .publish((symbol_short!("v1"), symbol_short!("grace_upd")), secs);
+}
+
+/// Emitted when the admin updates the configurable archive wait period (SC-83).
+pub fn archive_wait_period_updated(env: &Env, secs: u64) {
+    env.events()
+        .publish((symbol_short!("v1"), symbol_short!("arch_upd")), secs);
+}
