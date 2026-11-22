@@ -1990,6 +1990,39 @@ impl StreamContract {
         receipt_owner(&env, &stream)
     }
 
+    /// Return stream IDs for which `holder` currently holds the withdraw
+    /// receipt (SC-88).
+    ///
+    /// This is distinct from [`stream_ids_by_employee`], which tracks the
+    /// *original* employee a stream was created for and does not change when
+    /// the receipt is transferred via [`transfer_receipt`]. This query
+    /// reflects the live receipt owner instead, so a buyer of a receipt can
+    /// discover which streams they now have withdraw rights over.
+    ///
+    /// Scans every stream ever created (bounded by [`stream_count`]), since
+    /// receipt transfers are not separately indexed.
+    ///
+    /// # Parameters
+    /// - `holder` — address to check current receipt ownership for
+    ///
+    /// # Returns
+    /// `Vec<u64>` of stream IDs currently held by `holder`, in ascending ID
+    /// order; empty if `holder` holds no receipts.
+    pub fn receipts_by_holder(env: Env, holder: Address) -> Vec<u64> {
+        let mut out: Vec<u64> = Vec::new(&env);
+        let total = Self::stream_count(env.clone());
+        let mut id = 1u64;
+        while id <= total {
+            if let Some(stream) = load_stream(&env, id) {
+                if receipt_owner(&env, &stream) == holder {
+                    out.push_back(id);
+                }
+            }
+            id += 1;
+        }
+        out
+    }
+
     /// Transfer a stream's receipt, and with it the right to withdraw future
     /// earnings, from `from` to `to` (PROD-01).
     ///
