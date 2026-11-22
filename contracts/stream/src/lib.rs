@@ -2098,6 +2098,61 @@ impl StreamContract {
         out
     }
 
+    /// Return the number of templates saved by `employer` (SC-89).
+    ///
+    /// Avoids loading every template's `StreamParams` just to count them.
+    ///
+    /// # Parameters
+    /// - `employer` — template owner to query
+    ///
+    /// # Returns
+    /// `u32` count; 0 if the employer has no saved templates.
+    pub fn template_count(env: Env, employer: Address) -> u32 {
+        get_template_ids(&env, &employer).len()
+    }
+
+    /// Return a page of templates saved by `employer` as `(template_id, params)`
+    /// pairs, ordered by template ID (SC-89).
+    ///
+    /// Unlike [`list_templates`], which returns every template in one call,
+    /// this bounds the amount of work and storage reads per invocation so
+    /// employers with many templates do not blow the instruction budget.
+    /// `limit` is capped at 50.
+    ///
+    /// # Parameters
+    /// - `employer` — template owner to query
+    /// - `start_after` — template ID to start after (exclusive); pass the
+    ///   last `template_id` returned by the previous page, or omit to start
+    ///   from the beginning
+    /// - `limit` — maximum number of templates to return (capped at 50)
+    ///
+    /// # Returns
+    /// `Vec<(u32, StreamParams)>` page of templates in ascending ID order.
+    pub fn list_templates_paginated(
+        env: Env,
+        employer: Address,
+        start_after: Option<u32>,
+        limit: u32,
+    ) -> Vec<(u32, StreamParams)> {
+        let capped_limit = limit.min(50);
+        let mut out: Vec<(u32, StreamParams)> = Vec::new(&env);
+        let threshold = start_after;
+        for id in get_template_ids(&env, &employer).iter() {
+            if out.len() >= capped_limit {
+                break;
+            }
+            if let Some(after) = threshold {
+                if id <= after {
+                    continue;
+                }
+            }
+            if let Some(p) = load_template(&env, &employer, id) {
+                out.push_back((id, p));
+            }
+        }
+        out
+    }
+
     /// Admin upgrades the contract WASM in-place.
     ///
     /// The new WASM must be uploaded to the network before calling this.
