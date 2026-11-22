@@ -5037,6 +5037,79 @@ fn test_cliff_reached_event_emitted_once() {
     assert_eq!(count(&env), 0, "cliff_reached is not emitted again");
 }
 
+/// TEST-57 (#572): claimable is 0 before the cliff, the cliff_reached event
+/// fires exactly once with the cliff timestamp, and accrual afterwards is
+/// measured from cliff_time rather than start_time.
+#[test]
+fn test_cliff_reached_event_and_accrual_from_cliff() {
+    use soroban_sdk::{symbol_short, vec, IntoVal};
+
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let start_time = env.ledger().timestamp();
+    let cliff_time = start_time + 1_000;
+    let rate: i128 = 10;
+    let id = client.create_stream(
+        &employer,
+        &employee,
+        &token_id,
+        &10_000,
+        &rate,
+        &0,
+        &None,
+        &Some(cliff_time),
+    );
+    assert_eq!(client.get_cliff_time(&id), Some(cliff_time));
+
+    let cliff_topics = vec![
+        &env,
+        symbol_short!("v1").into_val(&env),
+        symbol_short!("cliff").into_val(&env),
+        id.into_val(&env),
+    ];
+    let cliff_events = |env: &Env| {
+        crate::test::all_events(env)
+            .iter()
+            .filter(|(_, topics, _)| *topics == cliff_topics)
+            .collect::<std::vec::Vec<_>>()
+    };
+
+    // Before the cliff: nothing is claimable and no event has fired.
+    env.ledger().with_mut(|l| l.timestamp = cliff_time - 1);
+    assert_eq!(client.claimable(&id), 0, "claimable must be 0 before the cliff");
+    assert_eq!(client.withdraw(&employee, &id), 0);
+    assert_eq!(cliff_events(&env).len(), 0, "no cliff event before the cliff");
+
+    // Crossing the cliff emits exactly one cliff_reached event carrying cliff_time.
+    env.ledger().with_mut(|l| l.timestamp = cliff_time);
+    assert_eq!(client.claimable(&id), 0);
+    let events = cliff_events(&env);
+    assert_eq!(events.len(), 1, "cliff_reached must be emitted exactly once");
+    let (_, _, data) = events.get(0).unwrap();
+    let emitted_cliff: u64 =
+        <u64 as soroban_sdk::FromVal<Env, soroban_sdk::Val>>::from_val(&env, data);
+    assert_eq!(emitted_cliff, cliff_time, "event data must be the cliff time");
+
+    // Accrual is anchored at cliff_time, not start_time.
+    env.ledger().with_mut(|l| l.timestamp = cliff_time + 50);
+    assert_eq!(client.claimable(&id), 50 * rate);
+    assert_eq!(client.claimable_at(&id, &(cliff_time + 100)), 100 * rate);
+    assert_eq!(cliff_events(&env).len(), 1, "cliff_reached is not re-emitted");
+
+    // Withdrawing past the cliff pays only post-cliff accrual.
+    env.ledger().with_mut(|l| l.timestamp = cliff_time + 100);
+    assert_eq!(client.withdraw(&employee, &id), 100 * rate);
+    let token = paystream_token::TokenContractClient::new(&env, &token_id);
+    assert_eq!(token.balance(&employee), 100 * rate);
+    assert_eq!(cliff_events(&env).len(), 1, "cliff_reached still emitted once");
+}
+
 #[test]
 #[should_panic(expected = "E035")]
 fn test_cliff_after_stop_time_rejected() {
