@@ -265,7 +265,9 @@ impl StreamContract {
         assert_eq!(admin, stored_admin, "{}", ERR_NOT_ADMIN);
         consume_admin_nonce(&env, nonce);
         assert!(amount > 0, "{}", ERR_ZERO_DEPOSIT);
+        let old_amount = get_min_deposit(&env);
         set_min_deposit(&env, amount);
+        events::min_deposit_updated(&env, old_amount, amount);
     }
 
     /// Set the maximum number of streams an employer may create per ledger.
@@ -314,6 +316,7 @@ impl StreamContract {
         assert!(fee_bps <= 100, "protocol fee cannot exceed 100 basis points");
         consume_admin_nonce(&env, nonce);
         set_protocol_fee(&env, fee_bps, &treasury);
+        events::protocol_fee_updated(&env, fee_bps, &treasury);
     }
 
     /// Employer creates a salary stream and deposits funds into the contract escrow.

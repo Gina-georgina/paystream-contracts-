@@ -226,3 +226,23 @@ pub fn max_creates_per_ledger_updated(env: &Env, max: u32) {
     env.events()
         .publish((symbol_short!("v1"), symbol_short!("rl_upd"),), max);
 }
+
+/// Emitted when the admin changes the minimum deposit (SC-85).
+///
+/// Topics: `("v1", "min_dep")`; data: `(old_amount, new_amount)`.
+pub fn min_deposit_updated(env: &Env, old_amount: i128, new_amount: i128) {
+    env.events().publish(
+        (symbol_short!("v1"), symbol_short!("min_dep")),
+        (old_amount, new_amount),
+    );
+}
+
+/// Emitted when the admin changes the protocol fee or treasury (SC-85).
+///
+/// Topics: `("v1", "fee_upd")`; data: `(fee_bps, treasury)`.
+pub fn protocol_fee_updated(env: &Env, fee_bps: u32, treasury: &Address) {
+    env.events().publish(
+        (symbol_short!("v1"), symbol_short!("fee_upd")),
+        (fee_bps, treasury.clone()),
+    );
+}
