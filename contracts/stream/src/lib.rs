@@ -32,6 +32,7 @@ use storage::{
     set_protocol_fee,
     check_and_increment_create_rate, get_stream_ended_at, load_stream_any, set_split_beneficiaries,
     ARCHIVE_WAIT_PERIOD, GRACE_PERIOD, SECONDS_PER_DAY, get_linear_vest_schedule, get_protocol_fee, get_stream_type, linear_vest_claimable_amount, set_linear_vest_schedule, set_stream_ended_at, set_max_creates_per_ledger as store_max_creates,
+    get_employer_create_count, get_max_creates_per_ledger,
     accrual_start, claimable_amount, clear_pending_admin, clear_pending_upgrade,
     consume_admin_nonce, delete_template, get_admin, get_admin_nonce, get_auto_topup,
     get_employee_streams, get_employer_streams, get_min_deposit, get_pending_admin,
@@ -2288,6 +2289,23 @@ impl StreamContract {
     /// Returns `(0, None)` when no fee has been configured.
     pub fn get_protocol_fee(env: Env) -> (u32, Option<Address>) {
         get_protocol_fee(&env)
+    }
+
+    /// Return the employer's stream-creation budget for the current ledger (SC-84).
+    ///
+    /// Lets employers (and dashboards) discover how many more streams they may
+    /// create before hitting the per-ledger rate limit.
+    ///
+    /// # Parameters
+    /// - `employer` — employer address to query
+    ///
+    /// # Returns
+    /// `(used, limit)` — streams already created by `employer` in the current
+    /// ledger, and the configured per-ledger maximum.
+    pub fn max_creates_per_ledger_query(env: Env, employer: Address) -> (u32, u32) {
+        let used = get_employer_create_count(&env, &employer);
+        let limit = get_max_creates_per_ledger(&env);
+        (used, limit)
     }
 
     /// Return all stream IDs owned by `employer`.
