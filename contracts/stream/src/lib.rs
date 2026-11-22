@@ -2564,6 +2564,30 @@ impl StreamContract {
         stream_ids_by_employee(&env, &employee).len() as u64
     }
 
+    /// Return the lifetime total already withdrawn across all of `employee`'s
+    /// streams (SC-87).
+    ///
+    /// Sums `Stream.withdrawn` over the employee's indexed streams, giving an
+    /// earnings-to-date figure for dashboards/reporting. Iteration is bounded
+    /// by the employee's own stream count (via [`stream_ids_by_employee`]),
+    /// not by the total number of streams in the contract.
+    ///
+    /// # Parameters
+    /// - `employee` — employee address to query
+    ///
+    /// # Returns
+    /// `i128` sum of `withdrawn` across the employee's streams; 0 if the
+    /// employee has no streams.
+    pub fn total_withdrawn_by_employee(env: Env, employee: Address) -> i128 {
+        let mut total: i128 = 0;
+        for stream_id in stream_ids_by_employee(&env, &employee).iter() {
+            if let Some(stream) = load_stream(&env, stream_id) {
+                total = total.checked_add(stream.withdrawn).expect(ERR_OVERFLOW);
+            }
+        }
+        total
+    }
+
     /// Return a page of stream IDs funded with `token`.
     ///
     /// `limit` is capped at 50. If `offset` is at or beyond the number of
