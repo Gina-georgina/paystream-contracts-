@@ -363,6 +363,9 @@ pub const ERR_INVALID_AUTO_TOPUP: &str = "E030: invalid auto top-up parameters";
 /// `archive_stream` was called before `ARCHIVE_WAIT_PERIOD` elapsed.
 pub const ERR_ARCHIVE_TOO_EARLY: &str = "E031: archive waiting period has not elapsed";
 
+/// `withdraw_amount` was called with an amount greater than claimable (SC-81).
+pub const ERR_EXCEEDS_CLAIMABLE: &str = "E036: amount exceeds claimable balance";
+
 // Restored from 24db2de (dropped by a merge).
 /// Protocol fee configuration. Absent configuration means fees are disabled.
 #[contracttype]

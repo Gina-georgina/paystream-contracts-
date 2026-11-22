@@ -49,6 +49,7 @@ use storage::{
 use types::{
     AutoTopupConfig, PendingUpgrade, SplitBeneficiary,
     ERR_ARCHIVE_TOO_EARLY, ERR_BELOW_MIN_DEPOSIT, ERR_INVALID_AUTO_TOPUP, ERR_INVALID_RATE, ERR_NO_AUTO_TOPUP, ERR_NO_PENDING_UPGRADE, ERR_STOP_TIME_PAST, ERR_STREAM_NOT_ENDED, ERR_UPGRADE_TIMELOCK_ACTIVE, ERR_ZERO_RATE,
+    ERR_AMOUNT_NOT_POSITIVE, ERR_EXCEEDS_CLAIMABLE,
     DataKey, LinearVestSchedule, Stream, StreamParams, StreamStatus, StreamType,
     ERR_ADMIN_NOT_SET, ERR_BAD_PENDING_NONCE,
     ERR_BATCH_TOO_LARGE, ERR_CONTRACT_PAUSED, ERR_EMPTY_PARAMS, ERR_NEW_EMPLOYER_IS_EMPLOYEE, ERR_NOT_ADMIN,
@@ -886,6 +887,111 @@ impl StreamContract {
         stream.last_withdraw_time = accrual_start(&env, stream.id, now);
         // Clear any banked pre-rate-change accrual now that it has been paid out.
         stream.pending_accrual = 0;
+        if stream.withdrawn >= stream.deposit {
+            set_stream_ended_at(&env, stream_id, now);
+            stream.status = StreamStatus::Exhausted;
+        }
+
+        let token_client = token::Client::new(&env, &stream.token);
+        token_client.transfer(&env.current_contract_address(), &employee, &amount);
+        maybe_auto_topup(&env, &mut stream, now);
+
+        stream.locked = false;
+        save_stream(&env, &stream);
+        events::withdrawn(&env, stream_id, &employee, amount);
+        let remaining = stream.deposit - stream.withdrawn;
+        if stream.low_balance_threshold > 0 && remaining < stream.low_balance_threshold {
+            events::low_balance(
+                &env,
+                stream_id,
+                &stream.employer,
+                remaining,
+                stream.low_balance_threshold,
+            );
+        }
+        amount
+    }
+
+    /// Employee withdraws up to a requested amount from a stream (SC-81).
+    ///
+    /// Behaves like [`withdraw`] but caps the transferred amount at
+    /// `requested_amount` instead of always claiming everything. The
+    /// remainder, if any, stays claimable and can be withdrawn later. Useful
+    /// for partial payouts.
+    ///
+    /// # Parameters
+    /// - `employee` — employee address; must authenticate (requires auth)
+    /// - `stream_id` — ID of the stream to withdraw from
+    /// - `requested_amount` — amount to withdraw, capped at the claimable total
+    ///
+    /// # Returns
+    /// The actual amount transferred (`min(requested_amount, claimable)`).
+    ///
+    /// # Errors
+    /// - Panics if contract is paused
+    /// - E015 if stream not found
+    /// - E016 if caller is not the receipt holder
+    /// - E017 if stream is not Active/Exhausted
+    /// - E023 if `requested_amount` is not positive
+    /// - E036 if `requested_amount` exceeds the claimable amount
+    /// - E003 if a reentrant withdraw is detected
+    pub fn withdraw_amount(
+        env: Env,
+        employee: Address,
+        stream_id: u64,
+        requested_amount: i128,
+    ) -> i128 {
+        employee.require_auth();
+        assert!(!get_paused(&env), "{}", ERR_CONTRACT_PAUSED);
+        assert!(requested_amount > 0, "{}", ERR_AMOUNT_NOT_POSITIVE);
+        let mut stream = load_stream(&env, stream_id).expect(ERR_STREAM_NOT_FOUND);
+        assert_eq!(
+            receipt_owner(&env, &stream),
+            employee,
+            "{}",
+            ERR_NOT_EMPLOYEE
+        );
+        assert!(
+            stream.status == StreamStatus::Active || stream.status == StreamStatus::Exhausted,
+            "{}",
+            ERR_STREAM_NOT_ACTIVE
+        );
+
+        let now = env.ledger().timestamp();
+        if let Some(c) = mark_cliff_reached(&env, stream.id, now) {
+            events::cliff_reached(&env, stream.id, c);
+        }
+        let claimable = stream_claimable_amount(&env, &stream, now);
+        assert!(requested_amount <= claimable, "{}", ERR_EXCEEDS_CLAIMABLE);
+
+        if claimable == 0 {
+            if stream.status == StreamStatus::Active
+                && stream.stop_time > 0
+                && now >= stream.stop_time
+            {
+                stream.status = StreamStatus::Exhausted;
+                save_stream(&env, &stream);
+                events::stream_status_changed(&env, stream_id, &StreamStatus::Exhausted);
+            }
+            return 0;
+        }
+
+        assert!(!stream.locked, "{}", ERR_REENTRANT);
+        stream.locked = true;
+        save_stream(&env, &stream);
+
+        let amount = requested_amount;
+        stream.withdrawn = stream
+            .withdrawn
+            .checked_add(amount)
+            .expect(ERR_OVERFLOW);
+        // Only advance the accrual clock and clear banked accrual when the
+        // full claimable amount was withdrawn; a partial withdraw leaves the
+        // remainder claimable from the same accrual point.
+        if amount == claimable {
+            stream.last_withdraw_time = accrual_start(&env, stream.id, now);
+            stream.pending_accrual = 0;
+        }
         if stream.withdrawn >= stream.deposit {
             set_stream_ended_at(&env, stream_id, now);
             stream.status = StreamStatus::Exhausted;
