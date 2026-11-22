@@ -1904,6 +1904,54 @@ impl StreamContract {
         stream_claimable_amount(&env, &stream, timestamp)
     }
 
+    /// Query how much would accrue to the employee within the window
+    /// [`start`, `end`], without performing a withdraw (SC-86).
+    ///
+    /// Useful for payroll reporting over a specific period (e.g. "how much
+    /// did this employee earn in October") independent of when they actually
+    /// withdraw. Internally this is the difference between the claimable
+    /// projection at `end` and at `start`, so it automatically respects the
+    /// same cliff, pause, and `stop_time` rules as [`claimable_at`]: time
+    /// before a cliff or while paused contributes nothing, and accrual stops
+    /// at `stop_time`.
+    ///
+    /// Both bounds are clamped to the stream's lifetime (`accrual_start` and
+    /// `stop_time`, when set) before projecting, so a window that extends
+    /// before creation or past a hard stop_time does not over- or
+    /// under-count.
+    ///
+    /// # Parameters
+    /// - `stream_id` — ID of the stream to query
+    /// - `start` — inclusive lower bound of the window (Unix timestamp)
+    /// - `end` — inclusive upper bound of the window (Unix timestamp)
+    ///
+    /// # Returns
+    /// Claimable amount accrued within the window as `i128`; 0 if the window
+    /// is empty or falls entirely outside the stream's lifetime.
+    ///
+    /// # Errors
+    /// - Panics if stream not found
+    /// - E033 if `start > end`
+    pub fn claimable_between(env: Env, stream_id: u64, start: u64, end: u64) -> i128 {
+        assert!(start <= end, "E033: start must be <= end");
+        let stream = load_stream(&env, stream_id).expect(ERR_STREAM_NOT_FOUND);
+
+        let lower = if stream.stop_time > 0 {
+            start.min(stream.stop_time)
+        } else {
+            start
+        };
+        let upper = if stream.stop_time > 0 {
+            end.min(stream.stop_time)
+        } else {
+            end
+        };
+
+        let at_lower = stream_claimable_amount(&env, &stream, lower);
+        let at_upper = stream_claimable_amount(&env, &stream, upper);
+        at_upper.saturating_sub(at_lower).max(0)
+    }
+
     /// Check if a stream's remaining deposit is below the low-balance threshold.
     /// Anyone can call this function to emit an on-demand low-balance alert (PROD-21).
     ///
