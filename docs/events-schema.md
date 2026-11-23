@@ -8,11 +8,13 @@ Indexer-facing record of event schema changes. **Process:** any PR that adds, re
 
 Each entry lists the event, the change (added field / renamed topic / removed field) and migration steps for indexers.
 
-### v1.1 (2026-10-04) — advisory cancel reason
+### v1.1 (2026-10-04) — advisory cancel reason, stream metadata and split vest streams
 
 | Event | Change | Migration |
 |-------|--------|-----------|
 | `cancelled` | Added optional `reason` (Symbol) at data[2], carrying a standard `CancelReason` value. Advisory only — not enforced on-chain | Treat missing `reason` (events before v1.1) as `"other"` |
+| `metadata_updated` | Added event `["v1", "meta_upd", <stream_id>]` with data `[metadata]` (`Map<Symbol, Symbol>`, bounded size) | Indexers that do not need metadata may ignore this event; treat streams without it as having empty metadata |
+| `split_vest_created` | Added event `["v1", "split_vest", <stream_id>]` with data `[employer, employee, rate, beneficiary, beneficiary_bps]` | Indexers that only handle `created` should also handle `split_vest` to track linear-vest split streams |
 
 ### v1.0 (2026-09-27) — baseline
 
@@ -125,6 +127,53 @@ Emitted when a stream's status changes (Active, Paused, Cancelled, Exhausted).
 {
   "topic": ["v1", "status", 1],
   "data": [1]
+}
+```
+
+---
+
+### stream_metadata_updated
+
+Emitted when a stream's structured metadata map is set or replaced via
+`update_stream_metadata` (#467). The map is capped in size by the contract;
+events are only emitted for accepted (within-cap) updates.
+
+**Topic**: `["v1", "meta_upd", <stream_id>]`
+
+**Data**:
+- `metadata` (Map<Symbol, Symbol>): The full metadata map after the update
+  (e.g. `department`, `cost_center`). An empty map clears the metadata.
+
+**Example**:
+```json
+{
+  "topic": ["v1", "meta_upd", 1],
+  "data": [{"department": "eng", "cost_center": "cc-42"}]
+}
+```
+
+---
+
+### split_vest_created
+
+Emitted when a linear-vest stream is created with a split beneficiary
+(#482). Claimable amounts are split between the employee and the
+beneficiary according to `beneficiary_bps`.
+
+**Topic**: `["v1", "split_vest", <stream_id>]`
+
+**Data**:
+- `employer` (Address): The employer address
+- `employee` (Address): The employee address
+- `rate` (i128): Tokens vested per second
+- `beneficiary` (Address): The split beneficiary address
+- `beneficiary_bps` (u32): Beneficiary share in basis points (0–10000)
+
+**Example**:
+```json
+{
+  "topic": ["v1", "split_vest", 1],
+  "data": ["GABCD...", "GEFGH...", 1000000, "GIJKL...", 2500]
 }
 ```
 
@@ -419,7 +468,7 @@ function parseV1Event(topic, data) {
 | Version | Date | Changes |
 |---------|------|---------|
 | v1 | 2026-09-27 | Initial schema version |
-| v1.1 | 2026-10-04 | Optional advisory `reason` (Symbol) on `cancelled`; standard `CancelReason` set documented |
+| v1.1 | 2026-10-04 | Optional advisory `reason` (Symbol) on `cancelled`; standard `CancelReason` set documented; added `metadata_updated` and `split_vest_created` events |
 
 ## Testing
 
