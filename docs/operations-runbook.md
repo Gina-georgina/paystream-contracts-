@@ -101,7 +101,32 @@ stellar contract invoke --id "$STREAM_ID" --source "$ADMIN" --network "$NETWORK"
 
 Eligible streams are transitioned to `Exhausted`; ineligible IDs are silently skipped. This keeps off-chain indexes accurate without reverting the whole batch.
 
+## 3b. Keeper: find and settle streams nearing expiry
+
+Keepers use the read-only `streams_expiring_before(timestamp)` query to discover streams whose `stop_time` is at or before the given timestamp. It reads from the `StreamsByTimestamp` index, does not mutate state, and returns a **bounded** result set — if more streams are eligible than the cap, only the first batch is returned, so re-run the query after processing to pick up the rest.
+
+```bash
+# Unix timestamp (seconds) — e.g. now + 1 hour to catch streams expiring soon
+export CUTOFF=$(($(date +%s) + 3600))
+
+stellar contract invoke --id "$STREAM_ID" --source "$KEEPER" --network "$NETWORK" \
+  -- streams_expiring_before --timestamp "$CUTOFF"
+```
+
+Feed the returned IDs into the appropriate call:
+
+```bash
+# Settle a single stream (permissionless once stop_time has passed)
+stellar contract invoke --id "$STREAM_ID" --source "$KEEPER" --network "$NETWORK" \
+  -- settle_stream --stream_id <STREAM_ID>
+
+# Or batch-expire streams past stop_time + GRACE_PERIOD (admin only — see section 3)
+stellar contract invoke --id "$STREAM_ID" --source "$ADMIN" --network "$NETWORK" \
+  -- expire_streams --admin "$ADMIN_ADDRESS" --nonce "$NONCE" --stream_ids '[<IDS>]'
+```
+
 ## 4. Admin transfer
+=======
 
 Two-step handover. The nonce passed to `propose_admin` must also be passed to `accept_admin`.
 

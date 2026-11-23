@@ -27,6 +27,15 @@ pub const ERR_DRAIN_TIMELOCK_ACTIVE: u32 = 0x1001;
 /// Error returned when a WASM upgrade would downgrade or re-apply the current version.
 pub const ERR_VERSION_DOWNGRADE: u32 = 0x1002;
 
+/// Maximum number of stream IDs returned by `streams_expiring_before`.
+pub const MAX_EXPIRING_RESULTS: u32 = 50;
+
+/// Maximum number of streams iterated by aggregate queries before erroring.
+pub const MAX_AGGREGATE_ITERATIONS: u32 = 100;
+
+/// Error returned when an aggregate query would iterate past `MAX_AGGREGATE_ITERATIONS`.
+pub const ERR_AGGREGATE_TOO_LARGE: u32 = 0x1005;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EmergencyDrainProposal {
@@ -104,6 +113,59 @@ pub fn get_max_batch_size(env: &Env) -> u32 {
 pub fn drain_timelock_elapsed(env: &Env, proposal: &EmergencyDrainProposal) -> bool {
     let now = env.ledger().timestamp();
     now.saturating_sub(proposal.proposed_at) >= DRAIN_TIMELOCK_SECONDS
+}
+
+/// Reads the `StreamsByTimestamp` day-bucket index entries in ascending order,
+/// collecting stream IDs whose `stop_time` is `<= timestamp`.
+///
+/// Iteration is bounded to `MAX_EXPIRING_RESULTS` returned IDs. This is a pure
+/// read: no storage is written and no TTLs are extended.
+pub fn collect_expiring_stream_ids(
+    env: &Env,
+    timestamp: u64,
+    max_results: u32,
+) -> soroban_sdk::Vec<u64> {
+    let mut results = soroban_sdk::Vec::new(env);
+    if max_results == 0 {
+        return results;
+    }
+    let index: Map<u64, soroban_sdk::Vec<u64>> = env
+        .storage()
+        .persistent()
+        .get(&crate::DataKey::StreamsByTimestamp)
+        .unwrap_or_else(|| Map::new(env));
+    for (bucket, ids) in index.iter() {
+        if bucket > timestamp {
+            continue;
+        }
+        for id in ids.iter() {
+            if results.len() >= max_results {
+                return results;
+            }
+            results.push_back(id);
+        }
+    }
+    results
+}
+
+/// Returns the stream ID list indexed for `employee`, or an empty list.
+///
+/// Pure read: no storage writes and no TTL extension.
+pub fn stream_ids_by_employee(env: &Env, employee: &Address) -> soroban_sdk::Vec<u64> {
+    env.storage()
+        .persistent()
+        .get(&crate::DataKey::EmployeeStreams(employee.clone()))
+        .unwrap_or_else(|| soroban_sdk::Vec::new(env))
+}
+
+/// Returns the stream ID list indexed for `employer`, or an empty list.
+///
+/// Pure read: no storage writes and no TTL extension.
+pub fn stream_ids_by_employer(env: &Env, employer: &Address) -> soroban_sdk::Vec<u64> {
+    env.storage()
+        .persistent()
+        .get(&crate::DataKey::EmployerStreams(employer.clone()))
+        .unwrap_or_else(|| soroban_sdk::Vec::new(env))
 }
 
 /// Panics with `ERR_VERSION_DOWNGRADE` unless `new_version` is strictly greater

@@ -1245,6 +1245,129 @@ stellar contract invoke --id <STREAM_ID> --source <ANY_KEY> --network testnet \
 
 ---
 
+### `streams_expiring_before`
+
+Return stream IDs whose `stop_time` is at or before `timestamp`, sourced from the
+`StreamsByTimestamp` index. Keepers use this to find streams nearing `stop_time`
+so they can call `settle_stream` / `expire_streams` (SC-53).
+
+The result set is bounded: at most `MAX_EXPIRING_QUERY` (50) IDs are returned,
+in ascending `stream_id` order. The query is read-only and never mutates state.
+
+**Caller:** Anyone
+
+| Parameter | Type | Description |
+|---|---|---|
+| `timestamp` | `u64` | Inclusive upper bound on `stop_time` (Unix timestamp in seconds) |
+
+**Returns:** `Vec<u64>` — stream IDs with `stop_time <= timestamp`, capped at 50 entries
+
+**Errors:** None (returns an empty vector when no streams match)
+
+**Keeper runbook:** poll this query on a schedule, then call `settle_stream` for
+each returned ID whose `stop_time` has been reached, or pass the IDs to
+`expire_streams` once `stop_time + GRACE_PERIOD` has elapsed.
+
+**Example:**
+```bash
+stellar contract invoke --id <STREAM_ID> --source <KEEPER_KEY> --network testnet \
+  -- streams_expiring_before --timestamp 1800000000
+```
+
+---
+
+### `total_claimable_by_employee`
+
+Read-only aggregate returning the sum of `claimable` across an employee's
+`Active` streams (SC-54). Lets dashboards show a total without N round-trips.
+
+Iteration is bounded: the call panics with E029 if the employee has more streams
+than the configured maximum batch size (default 50, see `set_max_batch_size`).
+
+**Caller:** Anyone
+
+| Parameter | Type | Description |
+|---|---|---|
+| `employee` | `Address` | Employee address to aggregate |
+
+**Returns:** `i128` — sum of claimable amounts over the employee's Active streams; 0 if none
+
+**Errors:**
+- E029 if the employee's stream index exceeds the configured maximum batch size
+- E004 if the aggregate arithmetic overflows
+
+**Example:**
+```bash
+stellar contract invoke --id <STREAM_ID> --source <ANY_KEY> --network testnet \
+  -- total_claimable_by_employee --employee <EMPLOYEE_ADDRESS>
+```
+
+---
+
+### `total_locked_by_employer`
+
+Read-only aggregate returning the sum of `deposit - withdrawn` across an
+employer's `Active` streams (SC-55). Useful for employer dashboards showing the
+total remaining escrow.
+
+Iteration is bounded: the call panics with E029 if the employer has more streams
+than the configured maximum batch size (default 50, see `set_max_batch_size`).
+
+**Caller:** Anyone
+
+| Parameter | Type | Description |
+|---|---|---|
+| `employer` | `Address` | Employer address to aggregate |
+
+**Returns:** `i128` — sum of remaining (`deposit - withdrawn`) over the employer's Active streams; 0 if none
+
+**Errors:**
+- E029 if the employer's stream index exceeds the configured maximum batch size
+- E004 if the aggregate arithmetic overflows
+
+**Example:**
+```bash
+stellar contract invoke --id <STREAM_ID> --source <ANY_KEY> --network testnet \
+  -- total_locked_by_employer --employer <EMPLOYER_ADDRESS>
+```
+
+---
+
+### `stream_summary`
+
+Return a lightweight summary of a stream instead of the full `Stream` struct
+(SC-56). Indexers polling many streams should prefer this over `get_stream` to
+reduce read and serialization cost.
+
+**Caller:** Anyone
+
+| Parameter | Type | Description |
+|---|---|---|
+| `stream_id` | `u64` | ID of the stream to summarize |
+
+**Returns:** `StreamSummary` — a small struct with the fields below
+
+**`StreamSummary` fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | `u64` | Stream ID |
+| `status` | `StreamStatus` | Active / Paused / Cancelled / Exhausted |
+| `claimable` | `i128` | Tokens claimable right now (same calculation as `claimable`) |
+| `remaining` | `i128` | `deposit - withdrawn` |
+| `rate` | `i128` | Current `rate_per_second` |
+
+**Errors:**
+- Panics if stream not found
+
+**Example:**
+```bash
+stellar contract invoke --id <STREAM_ID> --source <ANY_KEY> --network testnet \
+  -- stream_summary --stream_id 1
+```
+
+---
+
 ### `stream_count`
 
 Total number of streams ever created.

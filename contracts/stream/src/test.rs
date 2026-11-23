@@ -5631,3 +5631,216 @@ fn test_split_vest_withdraw_distributes_claimable() {
     assert_eq!(token.balance(&b), 20_000);
     assert_eq!(client.get_stream(&id).withdrawn, 50_000);
 }
+
+// ---------------------------------------------------------------------------
+// SC-53 (#421): streams_expiring_before keeper query
+// ---------------------------------------------------------------------------
+
+/// No streams at all → empty result.
+#[test]
+fn test_streams_expiring_before_empty() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let ids = client.streams_expiring_before(&1_000);
+    assert!(ids.is_empty());
+}
+
+/// Only streams whose stop_time falls inside the window are returned.
+#[test]
+fn test_streams_expiring_before_partial_window() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    client.set_min_deposit(&admin, &0, &100);
+
+    // stop_time = start + deposit / rate
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let early = client.create_stream(&employer, &employee, &token_id, &100, &1, &0, &None, &None);
+    env.ledger().with_mut(|l| l.timestamp = 2_000);
+    let mid = client.create_stream(&employer, &employee, &token_id, &100, &1, &0, &None, &None);
+    env.ledger().with_mut(|l| l.timestamp = 3_000);
+    let late = client.create_stream(&employer, &employee, &token_id, &100, &1, &0, &None, &None);
+
+    // early stops at 1_100, mid at 2_100, late at 3_100.
+    let window = client.streams_expiring_before(&2_500);
+    assert_eq!(window.len(), 2);
+    assert!(window.iter().any(|id| id == early));
+    assert!(window.iter().any(|id| id == mid));
+    assert!(!window.iter().any(|id| id == late));
+
+    let none = client.streams_expiring_before(&1_050);
+    assert!(none.is_empty());
+}
+
+/// The result set is bounded even when many streams qualify.
+#[test]
+fn test_streams_expiring_before_is_bounded() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    client.set_min_deposit(&admin, &0, &100);
+    for _ in 0..60 {
+        client.create_stream(&employer, &employee, &token_id, &100, &1, &0, &None, &None);
+    }
+
+    let ids = client.streams_expiring_before(&u64::MAX);
+    assert!(ids.len() <= crate::MAX_QUERY_RESULTS);
+    assert!(!ids.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// SC-54 (#422): total_claimable_by_employee aggregate
+// ---------------------------------------------------------------------------
+
+/// Employee with no streams → 0.
+#[test]
+fn test_total_claimable_by_employee_empty() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employee = Address::generate(&env);
+    client.initialize(&admin);
+
+    assert_eq!(client.total_claimable_by_employee(&employee), 0);
+}
+
+/// Only Active streams contribute to the aggregate.
+#[test]
+fn test_total_claimable_by_employee_mixed_statuses() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    let active = client.create_stream(&employer, &employee, &token_id, &10_000, &10, &0, &None, &None);
+    let paused = client.create_stream(&employer, &employee, &token_id, &10_000, &10, &0, &None, &None);
+    let cancelled = client.create_stream(&employer, &employee, &token_id, &10_000, &10, &0, &None, &None);
+
+    env.ledger().with_mut(|l| l.timestamp += 100);
+    client.pause_stream(&employer, &paused, &None);
+    client.cancel_stream(&employer, &cancelled, &None);
+
+    // Only the active stream's claimable (100s * 10/s) is summed.
+    assert_eq!(client.total_claimable_by_employee(&employee), 1_000);
+    assert_eq!(client.claimable(&active), 1_000);
+}
+
+/// Too many streams for the employee → bounded iteration error.
+#[test]
+#[should_panic(expected = "E045")]
+fn test_total_claimable_by_employee_over_limit_panics() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    for _ in 0..(crate::MAX_AGGREGATE_STREAMS + 1) {
+        client.create_stream(&employer, &employee, &token_id, &10_000, &10, &0, &None, &None);
+    }
+
+    client.total_claimable_by_employee(&employee);
+}
+
+// ---------------------------------------------------------------------------
+// SC-55 (#423): total_locked_by_employer aggregate
+// ---------------------------------------------------------------------------
+
+/// Employer with no streams → 0.
+#[test]
+fn test_total_locked_by_employer_empty() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    client.initialize(&admin);
+
+    assert_eq!(client.total_locked_by_employer(&employer), 0);
+}
+
+/// Only Active streams contribute; withdrawn amounts are subtracted.
+#[test]
+fn test_total_locked_by_employer_mixed_statuses() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    let active = client.create_stream(&employer, &employee, &token_id, &10_000, &10, &0, &None, &None);
+    let paused = client.create_stream(&employer, &employee, &token_id, &10_000, &10, &0, &None, &None);
+    let cancelled = client.create_stream(&employer, &employee, &token_id, &10_000, &10, &0, &None, &None);
+
+    env.ledger().with_mut(|l| l.timestamp += 100);
+    client.withdraw(&employee, &active);
+    client.pause_stream(&employer, &paused, &None);
+    client.cancel_stream(&employer, &cancelled, &None);
+
+    // Active stream: deposit 10_000 - withdrawn 1_000 = 9_000.
+    assert_eq!(client.total_locked_by_employer(&employer), 9_000);
+}
+
+/// Too many streams for the employer → bounded iteration error.
+#[test]
+#[should_panic(expected = "E045")]
+fn test_total_locked_by_employer_over_limit_panics() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    for _ in 0..(crate::MAX_AGGREGATE_STREAMS + 1) {
+        client.create_stream(&employer, &employee, &token_id, &10_000, &10, &0, &None, &None);
+    }
+
+    client.total_locked_by_employer(&employer);
+}
+
+// ---------------------------------------------------------------------------
+// SC-56 (#424): stream_summary lightweight query
+// ---------------------------------------------------------------------------
+
+/// stream_summary returns the compact struct with the expected fields.
+#[test]
+fn test_stream_summary_fields() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    let id = client.create_stream(&employer, &employee, &token_id, &10_000, &10, &0, &None, &None);
+
+    env.ledger().with_mut(|l| l.timestamp += 100);
+    let summary = client.stream_summary(&id);
+    assert_eq!(summary.id, id);
+    assert_eq!(summary.status, StreamStatus::Active);
+    assert_eq!(summary.claimable, 1_000);
+    assert_eq!(summary.remaining, 9_000);
+    assert_eq!(summary.rate_per_second, 10);
+}
+
+/// stream_summary panics for a non-existent stream.
+#[test]
+#[should_panic(expected = "stream not found")]
+fn test_stream_summary_not_found_panics() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    client.stream_summary(&999);
+}

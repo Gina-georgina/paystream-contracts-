@@ -62,6 +62,25 @@ pub struct Stream {
     pub pause_reason: Option<soroban_sdk::String>,
 }
 
+/// Lightweight projection of a stream for indexers polling many streams.
+///
+/// Contains only the fields needed to display status and balances, avoiding
+/// the cost of returning the full [`Stream`] struct. See #424.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct StreamSummary {
+    /// Unique sequential stream identifier.
+    pub id: u64,
+    /// Current lifecycle state.
+    pub status: StreamStatus,
+    /// Tokens currently claimable by the employee.
+    pub claimable: i128,
+    /// Tokens still remaining in the stream's deposit.
+    pub remaining: i128,
+    /// Payroll rate in tokens per second; zero for linear vest streams.
+    pub rate: i128,
+}
+
 /// Vesting terms stored separately so existing persisted `Stream` values remain decodable.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -339,6 +358,15 @@ pub const ERR_METADATA_ENTRY_TOO_LONG: &str = "E037: metadata key or value excee
 
 /// E038: configured max batch size is outside the allowed bounds (#483).
 pub const ERR_INVALID_MAX_BATCH_SIZE: &str = "E038: max batch size out of bounds";
+
+/// E039: an aggregate query would iterate over more streams than the cap allows
+/// (#422 / #423).
+pub const ERR_AGGREGATE_TOO_LARGE: &str =
+    "E039: aggregate query exceeds the maximum number of streams";
+
+/// Maximum number of streams an aggregate query will iterate over before
+/// erroring with [`ERR_AGGREGATE_TOO_LARGE`] (#422 / #423).
+pub const MAX_AGGREGATE_STREAMS: u32 = 100;
 
 /// E030: stop_time extends beyond 10-year limit from now
 pub const ERR_STOP_TIME_TOO_FAR: &str = "E030: stop_time must not exceed 10 years from now";

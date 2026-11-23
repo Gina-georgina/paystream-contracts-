@@ -42,9 +42,10 @@ use storage::{
     remove_employer_stream, save_stream, save_template, set_admin, set_auto_topup, set_max_batch_size, set_min_deposit,
     set_pending_admin, set_pending_admin_nonce, set_pending_upgrade, set_receipt_owner,
     set_stream_cliff, set_stream_metadata, stream_ids_by_employee, stream_ids_by_employer, TIMELOCK_DELAY,
+    get_streams_by_timestamp,
 };
 use types::{
-    AutoTopupConfig, PendingUpgrade, SplitBeneficiary,
+    AutoTopupConfig, PendingUpgrade, SplitBeneficiary, StreamSummary,
     ERR_ARCHIVE_TOO_EARLY, ERR_BELOW_MIN_DEPOSIT, ERR_INVALID_AUTO_TOPUP, ERR_INVALID_RATE, ERR_NO_AUTO_TOPUP, ERR_NO_PENDING_UPGRADE, ERR_STOP_TIME_PAST, ERR_STREAM_NOT_ENDED, ERR_UPGRADE_TIMELOCK_ACTIVE, ERR_ZERO_RATE,
     DataKey, LinearVestSchedule, Stream, StreamParams, StreamStatus, StreamType,
     ERR_ADMIN_NOT_SET, ERR_BAD_PENDING_NONCE,
@@ -59,6 +60,12 @@ use validate::{
     validate_cliff, validate_create_stream, validate_metadata, validate_rate,
     validate_split_beneficiaries, validate_top_up,
 };
+
+/// Maximum number of stream IDs returned by [`StreamContract::streams_expiring_before`].
+pub const MAX_EXPIRING_RESULTS: u32 = 50;
+
+/// Maximum number of streams an aggregate query will iterate before erroring.
+pub const MAX_AGGREGATE_ITERATIONS: u32 = 100;
 
 fn get_paused(env: &Env) -> bool {
     env.storage()
@@ -1892,6 +1899,140 @@ impl StreamContract {
     /// - Panics if stream not found
     pub fn get_stream(env: Env, stream_id: u64) -> Stream {
         load_stream_any(&env, stream_id).expect(ERR_STREAM_NOT_FOUND)
+    }
+
+    /// Return a lightweight summary of a stream (SC-56 / #424).
+    ///
+    /// Cheaper than [`get_stream`] for indexers polling many streams: returns
+    /// only the fields needed for dashboards (id, status, claimable, remaining,
+    /// rate) instead of the full [`Stream`] struct.
+    ///
+    /// # Parameters
+    /// - `stream_id` — ID of the stream to summarise
+    ///
+    /// # Returns
+    /// A [`StreamSummary`] struct.
+    ///
+    /// # Errors
+    /// - E015 if the stream does not exist
+    pub fn stream_summary(env: Env, stream_id: u64) -> StreamSummary {
+        let stream = load_stream_any(&env, stream_id).expect(ERR_STREAM_NOT_FOUND);
+        let now = env.ledger().timestamp();
+        let claimable = stream_claimable_amount(&env, &stream, now);
+        let remaining = stream
+            .deposit
+            .checked_sub(stream.withdrawn)
+            .unwrap_or(0)
+            .max(0);
+        StreamSummary {
+            id: stream.id,
+            status: stream.status,
+            claimable,
+            remaining,
+            rate_per_second: stream.rate_per_second,
+        }
+    }
+
+    /// Return stream IDs whose `stop_time` is at or before `timestamp` (SC-53 / #421).
+    ///
+    /// Walks the `StreamsByTimestamp` index in ascending order and collects IDs
+    /// of streams that have a hard stop time and whose `stop_time <= timestamp`.
+    /// Intended for keeper runbooks that need to find streams nearing expiry so
+    /// they can call [`settle_stream`] or [`expire_streams`].
+    ///
+    /// The result is bounded to [`MAX_EXPIRING_RESULTS`] entries. This function
+    /// is read-only and never mutates state.
+    ///
+    /// # Parameters
+    /// - `timestamp` — inclusive upper bound on `stop_time` (Unix seconds)
+    ///
+    /// # Returns
+    /// `Vec<u64>` of matching stream IDs, in ascending index order.
+    pub fn streams_expiring_before(env: Env, timestamp: u64) -> Vec<u64> {
+        let mut out: Vec<u64> = Vec::new(&env);
+        for stream_id in get_streams_by_timestamp(&env).iter() {
+            if out.len() >= MAX_EXPIRING_RESULTS {
+                break;
+            }
+            if let Some(stream) = load_stream(&env, stream_id) {
+                if stream.stop_time > 0 && stream.stop_time <= timestamp {
+                    out.push_back(stream_id);
+                }
+            }
+        }
+        out
+    }
+
+    /// Sum the claimable amount across an employee's Active streams (SC-54 / #422).
+    ///
+    /// Read-only aggregate for dashboards, avoiding N round-trips. Iteration is
+    /// capped at [`MAX_AGGREGATE_ITERATIONS`] streams; the call panics past the
+    /// cap to avoid instruction blowups.
+    ///
+    /// # Parameters
+    /// - `employee` — employee address to aggregate
+    ///
+    /// # Returns
+    /// Sum of claimable amounts as `i128`.
+    ///
+    /// # Errors
+    /// - Panics if the employee has more than [`MAX_AGGREGATE_ITERATIONS`] streams
+    /// - E004 if the running sum overflows
+    pub fn total_claimable_by_employee(env: Env, employee: Address) -> i128 {
+        let stream_ids = get_employee_streams(&env, &employee);
+        assert!(
+            stream_ids.len() <= MAX_AGGREGATE_ITERATIONS,
+            "too many streams to aggregate"
+        );
+        let now = env.ledger().timestamp();
+        let mut total: i128 = 0;
+        for stream_id in stream_ids.iter() {
+            if let Some(stream) = load_stream(&env, stream_id) {
+                if stream.status == StreamStatus::Active {
+                    total = total
+                        .checked_add(stream_claimable_amount(&env, &stream, now))
+                        .expect(ERR_OVERFLOW);
+                }
+            }
+        }
+        total
+    }
+
+    /// Sum the remaining deposit across an employer's Active streams (SC-55 / #423).
+    ///
+    /// Computes `deposit - withdrawn` for each Active stream owned by `employer`.
+    /// Read-only. Iteration is capped at [`MAX_AGGREGATE_ITERATIONS`] streams;
+    /// the call panics past the cap to avoid instruction blowups.
+    ///
+    /// # Parameters
+    /// - `employer` — employer address to aggregate
+    ///
+    /// # Returns
+    /// Total remaining locked amount as `i128`.
+    ///
+    /// # Errors
+    /// - Panics if the employer has more than [`MAX_AGGREGATE_ITERATIONS`] streams
+    /// - E004 if the running sum overflows
+    pub fn total_locked_by_employer(env: Env, employer: Address) -> i128 {
+        let stream_ids = get_employer_streams(&env, &employer);
+        assert!(
+            stream_ids.len() <= MAX_AGGREGATE_ITERATIONS,
+            "too many streams to aggregate"
+        );
+        let mut total: i128 = 0;
+        for stream_id in stream_ids.iter() {
+            if let Some(stream) = load_stream(&env, stream_id) {
+                if stream.status == StreamStatus::Active {
+                    let remaining = stream
+                        .deposit
+                        .checked_sub(stream.withdrawn)
+                        .unwrap_or(0)
+                        .max(0);
+                    total = total.checked_add(remaining).expect(ERR_OVERFLOW);
+                }
+            }
+        }
+        total
     }
 
     /// Read the full state of up to 50 streams in a single call.

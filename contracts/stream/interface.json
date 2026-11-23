@@ -44,6 +44,38 @@
         { "name": "max", "type": "u32" }
       ],
       "returns": "()"
+    },
+    {
+      "name": "streams_expiring_before",
+      "description": "Keeper query returning a bounded set of stream IDs with stop_time <= timestamp, sourced from the StreamsByTimestamp index. Read-only.",
+      "params": [
+        { "name": "timestamp", "type": "u64" }
+      ],
+      "returns": "Vec<u64>"
+    },
+    {
+      "name": "total_claimable_by_employee",
+      "description": "Read-only aggregate of claimable amounts across an employee's active streams. Bounded iteration; errors past the limit.",
+      "params": [
+        { "name": "employee", "type": "Address" }
+      ],
+      "returns": "i128"
+    },
+    {
+      "name": "total_locked_by_employer",
+      "description": "Read-only aggregate of remaining deposit (deposit - withdrawn) across an employer's active streams. Bounded iteration.",
+      "params": [
+        { "name": "employer", "type": "Address" }
+      ],
+      "returns": "i128"
+    },
+    {
+      "name": "stream_summary",
+      "description": "Lightweight summary of a stream (id, status, claimable, remaining, rate) for cheap polling instead of the full Stream struct.",
+      "params": [
+        { "name": "stream_id", "type": "u64" }
+      ],
+      "returns": "StreamSummary"
     }
   ],
   "events": [
