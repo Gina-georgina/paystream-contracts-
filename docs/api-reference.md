@@ -241,7 +241,7 @@ Employer creates a salary stream and deposits funds into the contract escrow.
 | `token_address` | `Address` | SEP-41 token contract address |
 | `deposit` | `i128` | Gross amount; configured fee is deducted before the net amount is locked in escrow |
 | `rate_per_second` | `i128` | Tokens streamed per second |
-| `stop_time` | `u64` | Hard stop timestamp (0 = indefinite) |
+| `stop_time` | `u64` | Hard stop timestamp (0 = indefinite). Must not exceed `now + MAX_STOP_TIME_OFFSET` (10 years) |
 | `low_balance_threshold` | `Option<i128>` | Emit a `low_bal` event after any withdraw that leaves less than this remaining (`None`/0 = disabled) |
 | `cliff_time` | `Option<u64>` | Cliff timestamp (PROD-17). Nothing accrues before it; once passed, accrual runs from `cliff_time` (not from the start). `None`, or a cliff at/before now, means no cliff |
 
@@ -262,6 +262,7 @@ cliff with `get_cliff_time(stream_id) -> Option<u64>`.
 - E001 if `rate_per_second` ≤ 0
 - E008 if `rate_per_second` > 1,000,000,000
 - Panics if `stop_time` is in the past (when non-zero)
+- E036 (`ERR_STOP_TIME_TOO_FAR`) if `stop_time` > `now + MAX_STOP_TIME_OFFSET` (10 years, i.e. `now + 315_360_000` seconds)
 - Panics if `employer` == `employee`
 - Panics if token transfer fails (insufficient balance or allowance)
 
@@ -478,14 +479,14 @@ Employer creates multiple salary streams atomically. All streams succeed or all 
 | `token` | `Address` | SEP-41 token contract address |
 | `deposit` | `i128` | Gross deposit; any configured protocol fee is deducted before escrow |
 | `rate_per_second` | `i128` | Tokens per second for this stream |
-| `stop_time` | `u64` | Hard stop timestamp (0 = indefinite) |
+| `stop_time` | `u64` | Hard stop timestamp (0 = indefinite). Must not exceed `now + MAX_STOP_TIME_OFFSET` (10 years) |
 | `cliff_time` | `Option<u64>` | Optional cliff (PROD-17); same rules as `create_stream`. Also stored in templates |
 
 **Returns:** `Vec<u64>` — list of new stream IDs in the same order as `params`
 
 **Limit:** Up to the configured maximum batch size per call (default 50, tunable via `set_max_batch_size` in the range 1–200)
 
-**Errors:** Same per-stream validations as `create_stream`, including protocol fee deduction; panics if `params` is empty or contains more entries than the configured maximum batch size (E029)
+**Errors:** Same per-stream validations as `create_stream`, including protocol fee deduction and the 10-year `stop_time` cap (E036 `ERR_STOP_TIME_TOO_FAR`); panics if `params` is empty or contains more entries than the configured maximum batch size (E029). Any single invalid entry reverts the whole batch.
 
 **Example:**
 ```bash
@@ -1433,6 +1434,64 @@ stellar contract invoke --id <STREAM_ID> --source <ANY_KEY> --network testnet \
 
 ---
 
+### `streams_by_token`
+
+Paginated token-level query (SC-51). Returns a page of stream IDs funded with a
+token using cursor-style pagination: pass the last ID from the previous page as
+`start_after` to fetch the next page. Ordering is ascending by `stream_id`,
+consistent with `streams_by_employee_paginated` and `get_streams_by_status`.
+
+**Caller:** Anyone
+
+| Parameter | Type | Description |
+|---|---|---|
+| `token` | `Address` | Token contract address to query |
+| `start_after` | `Option<u64>` | Return only IDs strictly greater than this cursor; `None` starts from the beginning |
+| `limit` | `u32` | Maximum number of IDs to return; capped at 50, `0` returns an empty vector |
+
+**Returns:** `Vec<u64>` — stream ID page in ascending order; empty when the cursor is at or past the last ID for the token
+
+**Errors:** None (unknown tokens return an empty vector)
+
+**Example:**
+```bash
+# First page
+stellar contract invoke --id <STREAM_ID> --source <ANY_KEY> --network testnet \
+  -- streams_by_token --token <TOKEN_ADDRESS> --start_after null --limit 20
+
+# Next page: pass the last ID from the previous page
+stellar contract invoke --id <STREAM_ID> --source <ANY_KEY> --network testnet \
+  -- streams_by_token --token <TOKEN_ADDRESS> --start_after 42 --limit 20
+```
+
+---
+
+### `get_streams_by_status`
+
+Paginated status query (SC-52). Returns a page of stream IDs currently in the
+given status, ascending by `stream_id`. Uses the on-chain status index, so no
+full storage scan is performed in the hot path.
+
+**Caller:** Anyone
+
+| Parameter | Type | Description |
+|---|---|---|
+| `status` | `StreamStatus` | One of `Active`, `Paused`, `Cancelled`, `Exhausted` |
+| `start_after` | `Option<u64>` | Return only IDs strictly greater than this cursor; `None` starts from the beginning |
+| `limit` | `u32` | Maximum number of IDs to return; capped at 50, `0` returns an empty vector |
+
+**Returns:** `Vec<u64>` — stream ID page in ascending order; empty when the cursor is at or past the last ID for the status
+
+**Errors:** None (a status with no streams returns an empty vector)
+
+**Example:**
+```bash
+stellar contract invoke --id <STREAM_ID> --source <ANY_KEY> --network testnet \
+  -- get_streams_by_status --status Active --start_after null --limit 20
+```
+
+---
+
 ### `admin_nonce`
 
 Return the current admin nonce. Use this to build the next admin transaction.
@@ -2088,6 +2147,7 @@ Keep this table in sync with that file (see [CONTRIBUTING.md](../CONTRIBUTING.md
 | E009 | `ERR_BAD_NONCE` | Invalid admin nonce | `propose_admin`, `pause_contract`, `unpause_contract`, `set_min_deposit`, `set_protocol_fee`, `upgrade`, `propose_upgrade`, `execute_upgrade`, `cancel_upgrade` | Read the current value with `admin_nonce` and pass it as `nonce` |
 | E029 | `ERR_BATCH_TOO_LARGE` | Batch contains more entries than the configured maximum batch size (default 50) | `create_streams_batch`, `cancel_streams_batch`, `pause_stream_batch`, `resume_stream_batch`, `get_streams_batch`, `claimable_batch` | Split the operation into batches no larger than the configured maximum (see `set_max_batch_size`) |
 | E030 | `ERR_INVALID_STOP_TIME` | Nonzero stop time precedes last withdrawal | `update_stop_time` | Use 0 or a timestamp at/after `last_withdraw_time` |
+| E036 | `ERR_STOP_TIME_TOO_FAR` | `stop_time` exceeds `now + MAX_STOP_TIME_OFFSET` (10 years) | `create_stream`, `create_streams_batch` | Use `stop_time = 0` (indefinite) or a timestamp at most 10 years from now |
 | T001 | `ERR_OVERFLOW` (token) | Token arithmetic overflow | Token `mint`, `mint_to_batch`, `transfer`, `transfer_from` | Use smaller amounts |
 | T002 | `ERR_PAUSED` (token) | Token is paused | Token `transfer`, `transfer_from`, `burn`, `burn_from` | Wait for the admin to call `unpause_token` |
 | T003 | `ERR_BATCH_TOO_LARGE` (token) | More than 50 recipients | Token `mint_to_batch` | Split into batches of at most 50 |

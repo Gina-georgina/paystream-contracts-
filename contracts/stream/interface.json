@@ -44,6 +44,49 @@
         { "name": "max", "type": "u32" }
       ],
       "returns": "()"
+    },
+    {
+      "name": "create_stream",
+      "description": "Create a linear stream. Rejects stop_time > now + MAX_STOP_TIME_OFFSET (10 years) with ERR_STOP_TIME_TOO_FAR.",
+      "params": [
+        { "name": "sender", "type": "Address" },
+        { "name": "recipient", "type": "Address" },
+        { "name": "token", "type": "Address" },
+        { "name": "amount", "type": "i128" },
+        { "name": "start_time", "type": "u64" },
+        { "name": "cliff_time", "type": "u64" },
+        { "name": "stop_time", "type": "u64" }
+      ],
+      "returns": "u64"
+    },
+    {
+      "name": "create_streams_batch",
+      "description": "Create multiple streams in one call. Each entry's stop_time must satisfy stop_time <= now + MAX_STOP_TIME_OFFSET (10 years), otherwise ERR_STOP_TIME_TOO_FAR.",
+      "params": [
+        { "name": "sender", "type": "Address" },
+        { "name": "streams", "type": "Vec<StreamParams>" }
+      ],
+      "returns": "Vec<u64>"
+    },
+    {
+      "name": "streams_by_token",
+      "description": "Paginated query of stream IDs for a token, ordered consistently with the status index. Returns at most `limit` IDs after `start_after`.",
+      "params": [
+        { "name": "token", "type": "Address" },
+        { "name": "start_after", "type": "Option<u64>" },
+        { "name": "limit", "type": "u32" }
+      ],
+      "returns": "Vec<u64>"
+    },
+    {
+      "name": "get_streams_by_status",
+      "description": "Paginated query of stream IDs for a status, ordered consistently with the token index. Returns at most `limit` IDs after `start_after`; no full storage scan.",
+      "params": [
+        { "name": "status", "type": "StreamStatus" },
+        { "name": "start_after", "type": "Option<u64>" },
+        { "name": "limit", "type": "u32" }
+      ],
+      "returns": "Vec<u64>"
     }
   ],
   "events": [

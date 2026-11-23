@@ -2231,6 +2231,317 @@ fn test_stream_ids_by_token_caps_limit_at_50() {
 }
 
 // ---------------------------------------------------------------------------
+// SC-51 (#419) – paginated streams_by_token query
+// ---------------------------------------------------------------------------
+
+/// streams_by_token returns ascending IDs for the requested token only.
+#[test]
+fn test_streams_by_token_paginated_ordering_and_isolation() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_a = setup_token(&env, &employer);
+    let token_b = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    client.create_stream(&employer, &employee, &token_a, &10_000, &10, &0, &None, &None);
+    client.create_stream(&employer, &employee, &token_b, &10_000, &10, &0, &None, &None);
+    client.create_stream(&employer, &employee, &token_a, &10_000, &10, &0, &None, &None);
+    client.create_stream(&employer, &employee, &token_a, &10_000, &10, &0, &None, &None);
+
+    let page = client.streams_by_token(&token_a, &0, &50);
+    assert_eq!(page.len(), 3);
+    assert_eq!(page.get(0).unwrap(), 1);
+    assert_eq!(page.get(1).unwrap(), 3);
+    assert_eq!(page.get(2).unwrap(), 4);
+
+    let other = client.streams_by_token(&token_b, &0, &50);
+    assert_eq!(other.len(), 1);
+    assert_eq!(other.get(0).unwrap(), 2);
+}
+
+/// streams_by_token honours start_after as an exclusive cursor.
+#[test]
+fn test_streams_by_token_paginated_cursor_walks_pages() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    for _ in 0..5 {
+        client.create_stream(&employer, &employee, &token, &10_000, &10, &0, &None, &None);
+    }
+
+    let first = client.streams_by_token(&token, &0, &2);
+    assert_eq!(first.len(), 2);
+    assert_eq!(first.get(0).unwrap(), 1);
+    assert_eq!(first.get(1).unwrap(), 2);
+
+    let second = client.streams_by_token(&token, &2, &2);
+    assert_eq!(second.len(), 2);
+    assert_eq!(second.get(0).unwrap(), 3);
+    assert_eq!(second.get(1).unwrap(), 4);
+
+    let third = client.streams_by_token(&token, &4, &2);
+    assert_eq!(third.len(), 1);
+    assert_eq!(third.get(0).unwrap(), 5);
+
+    let beyond_end = client.streams_by_token(&token, &5, &2);
+    assert!(beyond_end.is_empty());
+}
+
+/// streams_by_token caps the requested limit at 50.
+#[test]
+fn test_streams_by_token_paginated_caps_limit_at_50() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    for _ in 0..51 {
+        client.create_stream(&employer, &employee, &token, &10_000, &10, &0, &None, &None);
+    }
+
+    let page = client.streams_by_token(&token, &0, &100);
+    assert_eq!(page.len(), 50);
+    assert_eq!(page.get(49).unwrap(), 50);
+}
+
+/// streams_by_token returns an empty page for an unknown token.
+#[test]
+fn test_streams_by_token_paginated_unknown_token_returns_empty() {
+    let (env, client) = setup();
+    let token = Address::generate(&env);
+
+    assert!(client.streams_by_token(&token, &0, &50).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// SC-52 (#420) – paginated get_streams_by_status
+// ---------------------------------------------------------------------------
+
+/// Paginated status query returns Active streams in ascending ID order.
+#[test]
+fn test_get_streams_by_status_paginated_active() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    for _ in 0..3 {
+        client.create_stream(&employer, &employee, &token, &10_000, &10, &0, &None, &None);
+    }
+
+    let page = client.get_streams_by_status(&StreamStatus::Active, &0, &50);
+    assert_eq!(page.len(), 3);
+    assert_eq!(page.get(0).unwrap(), 1);
+    assert_eq!(page.get(1).unwrap(), 2);
+    assert_eq!(page.get(2).unwrap(), 3);
+}
+
+/// Paginated status query returns Paused streams only.
+#[test]
+fn test_get_streams_by_status_paginated_paused() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    let id1 = client.create_stream(&employer, &employee, &token, &10_000, &10, &0, &None, &None);
+    let id2 = client.create_stream(&employer, &employee, &token, &10_000, &10, &0, &None, &None);
+    client.create_stream(&employer, &employee, &token, &10_000, &10, &0, &None, &None);
+    client.pause_stream(&employer, &id1, &None);
+    client.pause_stream(&employer, &id2, &None);
+
+    let page = client.get_streams_by_status(&StreamStatus::Paused, &0, &50);
+    assert_eq!(page.len(), 2);
+    assert_eq!(page.get(0).unwrap(), id1);
+    assert_eq!(page.get(1).unwrap(), id2);
+}
+
+/// Paginated status query returns Cancelled streams only.
+#[test]
+fn test_get_streams_by_status_paginated_cancelled() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    let id1 = client.create_stream(&employer, &employee, &token, &10_000, &10, &0, &None, &None);
+    client.create_stream(&employer, &employee, &token, &10_000, &10, &0, &None, &None);
+    client.cancel_stream(&employer, &id1, &None);
+
+    let page = client.get_streams_by_status(&StreamStatus::Cancelled, &0, &50);
+    assert_eq!(page.len(), 1);
+    assert_eq!(page.get(0).unwrap(), id1);
+}
+
+/// Paginated status query returns Exhausted streams only.
+#[test]
+fn test_get_streams_by_status_paginated_exhausted() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    client.set_min_deposit(&admin, &0, &100);
+    let id = client.create_stream(&employer, &employee, &token, &500, &10, &0, &None, &None);
+    client.create_stream(&employer, &employee, &token, &10_000, &10, &0, &None, &None);
+    env.ledger().with_mut(|l| l.timestamp += 100);
+    client.withdraw(&employee, &id);
+
+    let page = client.get_streams_by_status(&StreamStatus::Exhausted, &0, &50);
+    assert_eq!(page.len(), 1);
+    assert_eq!(page.get(0).unwrap(), id);
+}
+
+/// Paginated status query honours start_after and caps the limit.
+#[test]
+fn test_get_streams_by_status_paginated_cursor_and_limit() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    for _ in 0..51 {
+        client.create_stream(&employer, &employee, &token, &10_000, &10, &0, &None, &None);
+    }
+
+    let capped = client.get_streams_by_status(&StreamStatus::Active, &0, &100);
+    assert_eq!(capped.len(), 50);
+    assert_eq!(capped.get(49).unwrap(), 50);
+
+    let next = client.get_streams_by_status(&StreamStatus::Active, &50, &100);
+    assert_eq!(next.len(), 1);
+    assert_eq!(next.get(0).unwrap(), 51);
+
+    let beyond_end = client.get_streams_by_status(&StreamStatus::Active, &51, &10);
+    assert!(beyond_end.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// SC-65 (#433) – MAX_STOP_TIME_OFFSET enforcement
+// ---------------------------------------------------------------------------
+
+/// stop_time exactly at now + MAX_STOP_TIME_OFFSET is accepted.
+#[test]
+fn test_create_stream_stop_time_at_cap_is_accepted() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let stop_time = 1_000 + crate::types::MAX_STOP_TIME_OFFSET;
+    let id = client.create_stream(
+        &employer,
+        &employee,
+        &token,
+        &10_000,
+        &10,
+        &stop_time,
+        &None,
+        &None,
+    );
+    assert_eq!(client.get_stream(&id).stop_time, stop_time);
+}
+
+/// stop_time one second past the cap is rejected.
+#[test]
+#[should_panic(expected = "E0")]
+fn test_create_stream_stop_time_over_cap_is_rejected() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let stop_time = 1_000 + crate::types::MAX_STOP_TIME_OFFSET + 1;
+    client.create_stream(
+        &employer,
+        &employee,
+        &token,
+        &10_000,
+        &10,
+        &stop_time,
+        &None,
+        &None,
+    );
+}
+
+/// Batch creation accepts a stop_time exactly at the cap.
+#[test]
+fn test_create_streams_batch_stop_time_at_cap_is_accepted() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let token = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    client.set_min_deposit(&admin, &0, &100);
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let stop_time = 1_000 + crate::types::MAX_STOP_TIME_OFFSET;
+
+    let mut params = soroban_sdk::Vec::new(&env);
+    params.push_back(StreamParams {
+        employee: Address::generate(&env),
+        token: token.clone(),
+        deposit: 10_000,
+        rate_per_second: 10,
+        stop_time,
+        cliff_time: None,
+    });
+    let ids = client.create_streams_batch(&employer, &params);
+    assert_eq!(ids.len(), 1);
+    assert_eq!(client.get_stream(&ids.get(0).unwrap()).stop_time, stop_time);
+}
+
+/// Batch creation rejects a stop_time one second past the cap.
+#[test]
+#[should_panic(expected = "E0")]
+fn test_create_streams_batch_stop_time_over_cap_is_rejected() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let token = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    client.set_min_deposit(&admin, &0, &100);
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let stop_time = 1_000 + crate::types::MAX_STOP_TIME_OFFSET + 1;
+
+    let mut params = soroban_sdk::Vec::new(&env);
+    params.push_back(StreamParams {
+        employee: Address::generate(&env),
+        token: token.clone(),
+        deposit: 10_000,
+        rate_per_second: 10,
+        stop_time,
+        cliff_time: None,
+    });
+    client.create_streams_batch(&employer, &params);
+}
+
+// ---------------------------------------------------------------------------
 // SC-06 – stream_status lightweight query
 // ---------------------------------------------------------------------------
 
