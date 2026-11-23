@@ -438,6 +438,47 @@ function parseV1Event(topic, data) {
 }
 ```
 
+## Indexer Implementation
+
+The off-chain indexer lives in `backend/indexer` (see its `README.md`). It
+polls the Soroban RPC `getEvents` endpoint (falling back to Horizon
+`/events?type=contract`) for the configured stream contract, starting at
+`START_LEDGER`, and persists decoded events to Postgres idempotently on
+`(contract_id, ledger_sequence, event_index)`.
+
+### Event topics decoded by the indexer
+
+The indexer decodes every topic documented above. Versioned events are matched
+on `topic[0] == "v1"` then `topic[1]`; unversioned events are matched on
+`topic[0]` directly.
+
+| Topic key | Event | Notes |
+|-----------|-------|-------|
+| `init` | `contract_initialized` | versioned |
+| `created` | `stream_created` | versioned |
+| `withdraw` | `withdrawn` | versioned |
+| `status` | `stream_status_changed` | versioned |
+| `meta_upd` | `stream_metadata_updated` | versioned (v1.1) |
+| `split_vest` | `split_vest_created` | versioned (v1.1) |
+| `cancelled` | `stream_cancelled` | versioned |
+| `topup` | `topped_up` | versioned |
+| `at_set` | `auto_topup_set` | versioned |
+| `at_up` | `auto_topped_up` | versioned |
+| `paused` | `contract_paused` | versioned |
+| `rate_upd` | `rate_updated` | versioned |
+| `cliff` | `cliff_reached` | versioned |
+| `upg_prop` | `upgrade_proposed` | versioned |
+| `upg_exec` | `upgrade_executed` | versioned |
+| `upg_cncl` | `upgrade_cancelled` | versioned |
+| `receipt` | `receipt` | unversioned |
+| `archived` | `archived` | unversioned |
+| `expired` | `expired` | unversioned |
+| `xfr_strm` | `xfr_strm` | unversioned |
+| `low_bal` | `low_bal` | unversioned |
+
+Unknown topics (including unknown schema versions) are logged and skipped
+without failing ingestion.
+
 ## Schema Migration History
 
 | Version | Date | Changes |

@@ -166,24 +166,31 @@ jobs:
           name: wasm-contracts
           path: target/wasm32-unknown-unknown/release/*.wasm
 
+  dashboard:
+    name: Dashboard CI
+    uses: ./.github/workflows/dashboard-ci.yml
+    secrets: inherit
+
   scheduled-summary:
     name: Scheduled CI summary
     if: ${{ always() && github.event_name == 'schedule' }}
-    needs: [test, build-wasm]
+    needs: [test, build-wasm, dashboard]
     runs-on: ubuntu-latest
     steps:
       - name: Report scheduled results
         env:
           TEST_RESULT: ${{ needs.test.result }}
           WASM_RESULT: ${{ needs.build-wasm.result }}
+          DASHBOARD_RESULT: ${{ needs.dashboard.result }}
         run: |
           {
             echo "## Weekly scheduled CI"
             echo ""
             echo "- Toolchain matrix: $TEST_RESULT"
             echo "- WASM build: $WASM_RESULT"
+            echo "- Dashboard: $DASHBOARD_RESULT"
           } >> "$GITHUB_STEP_SUMMARY"
-          if [[ "$TEST_RESULT" == "failure" || "$WASM_RESULT" == "failure" ]]; then
+          if [[ "$TEST_RESULT" == "failure" || "$WASM_RESULT" == "failure" || "$DASHBOARD_RESULT" == "failure" ]]; then
             echo "A scheduled CI job failed. Review the failed job logs above."
           else
             echo "Scheduled CI completed without blocking failures."
