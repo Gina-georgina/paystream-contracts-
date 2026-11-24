@@ -15,6 +15,9 @@ pub const MAX_MAX_BATCH_SIZE: u32 = 200;
 /// Maximum number of entries allowed in a stream's metadata map.
 pub const MAX_METADATA_ENTRIES: u32 = 8;
 
+/// Maximum number of stream IDs accepted by `withdraw_batch`.
+pub const MAX_WITHDRAW_BATCH_SIZE: u32 = 50;
+
 /// Error returned when a metadata map exceeds `MAX_METADATA_ENTRIES`.
 pub const ERR_METADATA_TOO_LARGE: u32 = 0x1003;
 
@@ -26,6 +29,9 @@ pub const ERR_DRAIN_TIMELOCK_ACTIVE: u32 = 0x1001;
 
 /// Error returned when a WASM upgrade would downgrade or re-apply the current version.
 pub const ERR_VERSION_DOWNGRADE: u32 = 0x1002;
+
+/// Error returned when `withdraw_batch` is called with an empty or oversized ID list.
+pub const ERR_WITHDRAW_BATCH_SIZE: u32 = 0x1005;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -170,6 +176,16 @@ impl ScheduleCache {
     }
 }
 
+/// Validates the size of a `withdraw_batch` ID list.
+///
+/// Panics with `ERR_WITHDRAW_BATCH_SIZE` when `len` is 0 or exceeds
+/// `MAX_WITHDRAW_BATCH_SIZE` (1..=50).
+pub fn assert_withdraw_batch_size(len: u32) {
+    if len == 0 || len > MAX_WITHDRAW_BATCH_SIZE {
+        panic!("{}", ERR_WITHDRAW_BATCH_SIZE);
+    }
+}
+
 #[cfg(test)]
 mod version_tests {
     use super::*;
@@ -196,5 +212,23 @@ mod version_tests {
         let env = Env::default();
         env.storage().instance().set(&crate::DataKey::Version, &2u32);
         assert_version_upgrade(&env, 3);
+    }
+
+    #[test]
+    fn withdraw_batch_size_accepts_valid_range() {
+        assert_withdraw_batch_size(1);
+        assert_withdraw_batch_size(MAX_WITHDRAW_BATCH_SIZE);
+    }
+
+    #[test]
+    #[should_panic]
+    fn withdraw_batch_size_rejects_empty() {
+        assert_withdraw_batch_size(0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn withdraw_batch_size_rejects_oversized() {
+        assert_withdraw_batch_size(MAX_WITHDRAW_BATCH_SIZE + 1);
     }
 }
