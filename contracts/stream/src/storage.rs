@@ -119,6 +119,57 @@ pub fn assert_version_upgrade(env: &Env, new_version: u32) {
     }
 }
 
+/// Cached view of a stream's cliff/schedule configuration.
+///
+/// Reading the cliff and schedule from storage is the dominant cost of
+/// `claimable_amount`. This struct lets callers load those values once and
+/// reuse them across repeated accrual computations (e.g. inside
+/// `withdraw_all`), guaranteeing at most one storage read per call.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScheduleCache {
+    pub cliff_time: u64,
+    pub start_time: u64,
+    pub end_time: u64,
+    pub total_amount: i128,
+}
+
+impl ScheduleCache {
+    /// Loads the cliff/schedule fields for `stream_id` exactly once.
+    ///
+    /// Returns `None` when the stream does not exist, matching the behavior of
+    /// the underlying storage lookups.
+    pub fn load(env: &Env, stream_id: u64) -> Option<Self> {
+        let stream: Option<crate::Stream> = env
+            .storage()
+            .persistent()
+            .get(&crate::DataKey::Stream(stream_id));
+        stream.map(|s| ScheduleCache {
+            cliff_time: s.cliff_time,
+            start_time: s.start_time,
+            end_time: s.end_time,
+            total_amount: s.total_amount,
+        })
+    }
+
+    /// Computes the claimable amount for `now` using the cached schedule,
+    /// performing no additional storage reads.
+    pub fn claimable_amount(&self, now: u64, withdrawn: i128) -> i128 {
+        if now < self.cliff_time || now < self.start_time {
+            return 0;
+        }
+        let elapsed = now.saturating_sub(self.start_time);
+        let duration = self.end_time.saturating_sub(self.start_time);
+        let vested = if duration == 0 || now >= self.end_time {
+            self.total_amount
+        } else {
+            self.total_amount
+                .saturating_mul(elapsed as i128)
+                / (duration as i128)
+        };
+        vested.saturating_sub(withdrawn).max(0)
+    }
+}
+
 #[cfg(test)]
 mod version_tests {
     use super::*;
