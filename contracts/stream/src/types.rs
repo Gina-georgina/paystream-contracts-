@@ -215,6 +215,11 @@ pub enum DataKey {
     /// Admin-configurable maximum batch size for batch entrypoints.
     /// Default: `MAX_BATCH_SIZE` (50). Bounded to 1..=200. See #483.
     MaxBatchSize,
+    /// Protocol fee actually deducted from a stream's deposit at creation:
+    /// stream ID → fee amount. Used on cancel to refund the employer the fee
+    /// proportional to the unstreamed deposit (SC-68 / #436). Missing keys
+    /// represent streams created before fee tracking existed (fee = 0).
+    StreamFeePaid(u64),
 }
 
 /// Contract error codes – panic messages reference these names so callers can

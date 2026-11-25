@@ -44,6 +44,39 @@
         { "name": "max", "type": "u32" }
       ],
       "returns": "()"
+    },
+    {
+      "name": "update_stop_time_batch",
+      "description": "Batched variant of update_stop_time for employers managing many streams. Accepts 1..=50 updates, applies update_stop_time validation per stream, and is all-or-nothing.",
+      "params": [
+        { "name": "employer", "type": "Address" },
+        { "name": "updates", "type": "Vec<(u64, u64)>" }
+      ],
+      "returns": "()"
+    },
+    {
+      "name": "get_min_deposit",
+      "description": "Read-only query returning the configured minimum deposit amount.",
+      "params": [],
+      "returns": "i128"
+    },
+    {
+      "name": "get_paused",
+      "description": "Read-only query returning whether the contract is paused.",
+      "params": [],
+      "returns": "bool"
+    },
+    {
+      "name": "get_admin",
+      "description": "Read-only query returning the current admin address.",
+      "params": [],
+      "returns": "Address"
+    },
+    {
+      "name": "get_pending_admin",
+      "description": "Read-only query returning the pending admin address, if any.",
+      "params": [],
+      "returns": "Option<Address>"
     }
   ],
   "events": [
@@ -60,6 +93,14 @@
       "description": "Emitted when the admin-configurable max batch size is changed.",
       "fields": [
         { "name": "max", "type": "u32" }
+      ]
+    },
+    {
+      "name": "stream_cancelled",
+      "description": "Emitted when a stream is cancelled, including the proportional protocol fee refunded to the employer.",
+      "fields": [
+        { "name": "stream_id", "type": "u64" },
+        { "name": "fee_refund", "type": "i128" }
       ]
     }
   ]

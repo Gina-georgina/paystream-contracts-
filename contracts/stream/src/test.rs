@@ -299,6 +299,271 @@ fn test_claimable_increases_with_time() {
     assert_eq!(client.claimable(&id), 1000);
 }
 
+// ---------------------------------------------------------------------------
+// SC-63 (#431) – update_stop_time_batch
+// ---------------------------------------------------------------------------
+
+fn stop_time_updates(env: &Env, entries: &[(u64, u64)]) -> soroban_sdk::Vec<(u64, u64)> {
+    let mut updates = soroban_sdk::Vec::new(env);
+    for (id, stop_time) in entries.iter() {
+        updates.push_back((*id, *stop_time));
+    }
+    updates
+}
+
+/// Happy path: multiple streams are updated and each change emits an event.
+#[test]
+fn test_update_stop_time_batch_succeeds_and_emits_event_per_change() {
+    use soroban_sdk::{symbol_short, vec, IntoVal};
+
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee1 = Address::generate(&env);
+    let employee2 = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    let id1 = client.create_stream(&employer, &employee1, &token_id, &10_000, &10, &0, &None, &None);
+    let id2 = client.create_stream(&employer, &employee2, &token_id, &10_000, &10, &0, &None, &None);
+
+    let updates = stop_time_updates(&env, &[(id1, 500), (id2, 600)]);
+    client.update_stop_time_batch(&employer, &updates);
+
+    assert_eq!(client.get_stream(&id1).stop_time, 500);
+    assert_eq!(client.get_stream(&id2).stop_time, 600);
+
+    let events = crate::test::all_events(&env);
+    for (id, stop_time) in [(id1, 500u64), (id2, 600u64)] {
+        let topics = vec![
+            &env,
+            symbol_short!("v1").into_val(&env),
+            symbol_short!("stop_time").into_val(&env),
+            id.into_val(&env),
+        ];
+        assert!(
+            events.iter().any(|(_, t, data)| t == topics
+                && <u64 as soroban_sdk::FromVal<Env, soroban_sdk::Val>>::from_val(&env, &data)
+                    == stop_time),
+            "missing stop_time event for stream {}",
+            id
+        );
+    }
+}
+
+/// An empty update list is rejected.
+#[test]
+#[should_panic(expected = "updates must not be empty")]
+fn test_update_stop_time_batch_empty_list_rejected() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    client.initialize(&admin);
+
+    let updates: soroban_sdk::Vec<(u64, u64)> = soroban_sdk::Vec::new(&env);
+    client.update_stop_time_batch(&employer, &updates);
+}
+
+/// More than 50 updates are rejected.
+#[test]
+#[should_panic(expected = "E029")]
+fn test_update_stop_time_batch_over_max_panics() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    let id = client.create_stream(&employer, &employee, &token_id, &10_000, &10, &0, &None, &None);
+    let mut updates = soroban_sdk::Vec::new(&env);
+    for _ in 0..51 {
+        updates.push_back((id, 500u64));
+    }
+    client.update_stop_time_batch(&employer, &updates);
+}
+
+/// A stream not owned by the caller rejects the whole batch.
+#[test]
+#[should_panic(expected = "not the employer")]
+fn test_update_stop_time_batch_wrong_employer_rejected() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer1 = Address::generate(&env);
+    let employer2 = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer1);
+
+    client.initialize(&admin);
+    let id = client.create_stream(&employer1, &employee, &token_id, &10_000, &10, &0, &None, &None);
+
+    let updates = stop_time_updates(&env, &[(id, 500)]);
+    client.update_stop_time_batch(&employer2, &updates);
+}
+
+/// A non-Active stream in the batch reverts every change (all-or-nothing).
+#[test]
+fn test_update_stop_time_batch_non_active_stream_reverts_all() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee1 = Address::generate(&env);
+    let employee2 = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    let id1 = client.create_stream(&employer, &employee1, &token_id, &10_000, &10, &0, &None, &None);
+    let id2 = client.create_stream(&employer, &employee2, &token_id, &10_000, &10, &0, &None, &None);
+    client.pause_stream(&employer, &id2, &None);
+
+    let updates = stop_time_updates(&env, &[(id1, 500), (id2, 600)]);
+    assert!(client.try_update_stop_time_batch(&employer, &updates).is_err());
+
+    assert_eq!(client.get_stream(&id1).stop_time, 0);
+    assert_eq!(client.get_stream(&id2).stop_time, 0);
+}
+
+/// An invalid stop time in the batch reverts every change (all-or-nothing).
+#[test]
+fn test_update_stop_time_batch_invalid_stop_time_reverts_all() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee1 = Address::generate(&env);
+    let employee2 = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    let id1 = client.create_stream(&employer, &employee1, &token_id, &10_000, &10, &0, &None, &None);
+    let id2 = client.create_stream(&employer, &employee2, &token_id, &10_000, &10, &0, &None, &None);
+
+    // A stop time in the past is invalid.
+    let updates = stop_time_updates(&env, &[(id1, 500), (id2, 1)]);
+    assert!(client.try_update_stop_time_batch(&employer, &updates).is_err());
+
+    assert_eq!(client.get_stream(&id1).stop_time, 0);
+    assert_eq!(client.get_stream(&id2).stop_time, 0);
+}
+
+// ---------------------------------------------------------------------------
+// SC-68 (#436) – proportional protocol fee refund on cancel
+// ---------------------------------------------------------------------------
+
+/// Cancelling a partially streamed stream refunds the employer's share of the
+/// protocol fee for the unstreamed deposit, without double-refunding.
+#[test]
+fn test_cancel_refunds_proportional_protocol_fee() {
+    use soroban_sdk::{symbol_short, vec, IntoVal};
+
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+    let token = paystream_token::TokenContractClient::new(&env, &token_id);
+    let employer_balance_before = token.balance(&employer);
+
+    client.initialize(&admin);
+    // 100 bps = 1% fee on a 100_000 deposit → 1_000 fee, 99_000 net deposit.
+    client.set_protocol_fee(&admin, &0, &100, &treasury);
+    let id = client.create_stream(&employer, &employee, &token_id, &100_000, &100, &0, &None, &None);
+
+    assert_eq!(client.get_stream(&id).deposit, 99_000);
+    assert_eq!(token.balance(&treasury), 1_000);
+
+    // Stream 25% of the deposit (99_000 / 100 rate = 990s total; 247s ≈ 24_700).
+    env.ledger().with_mut(|l| l.timestamp += 247);
+    client.cancel_stream(&employer, &id, &None);
+
+    let stream = client.get_stream(&id);
+    assert_eq!(stream.status, StreamStatus::Cancelled);
+    let earned = stream.withdrawn;
+    assert_eq!(earned, 24_700);
+    assert_eq!(token.balance(&employee), earned);
+
+    // Unstreamed deposit is 99_000 - 24_700 = 74_300; fee share is 1% of that.
+    let fee_refund = 743;
+    let expected_refund = (99_000 - earned) + fee_refund;
+    assert_eq!(
+        token.balance(&employer),
+        employer_balance_before - 100_000 + expected_refund
+    );
+
+    // Treasury keeps the fee on the streamed portion only; no double refund.
+    assert_eq!(token.balance(&treasury), 1_000 - fee_refund);
+
+    // The cancel event carries the fee refund amount.
+    let events = crate::test::all_events(&env);
+    let topics = vec![
+        &env,
+        symbol_short!("v1").into_val(&env),
+        symbol_short!("cancelled").into_val(&env),
+        id.into_val(&env),
+    ];
+    let mut found = false;
+    for (_, t, data) in events.iter() {
+        if t == topics {
+            let payload: (u64, i128, i128) =
+                <(u64, i128, i128) as soroban_sdk::FromVal<Env, soroban_sdk::Val>>::from_val(
+                    &env, &data,
+                );
+            assert_eq!(payload.2, fee_refund, "event must include fee_refund");
+            found = true;
+        }
+    }
+    assert!(found, "missing stream_cancelled event");
+}
+
+// ---------------------------------------------------------------------------
+// SC-70 (#438) / SC-71 (#439) – public read queries
+// ---------------------------------------------------------------------------
+
+/// get_min_deposit reflects the configured minimum deposit.
+#[test]
+fn test_get_min_deposit_snapshot() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    assert_eq!(client.get_min_deposit(), 0);
+    client.set_min_deposit(&admin, &0, &250);
+    assert_eq!(client.get_min_deposit(), 250);
+}
+
+/// get_paused reflects the global pause state.
+#[test]
+fn test_get_paused_snapshot() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    assert!(!client.get_paused());
+    client.set_paused(&admin, &0, &true);
+    assert!(client.get_paused());
+    client.set_paused(&admin, &1, &false);
+    assert!(!client.get_paused());
+}
+
+/// get_admin returns the current admin.
+#[test]
+fn test_get_admin_snapshot() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    assert_eq!(client.get_admin(), admin);
+}
+
+/// get_pending_admin is None until a transfer is proposed, then the nominee.
+#[test]
+fn test_get_pending_admin_snapshot() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let next = Address::generate(&env);
+    client.initialize(&admin);
+    assert_eq!(client.get_pending_admin(), None);
+    client.propose_admin(&admin, &0, &next);
+    assert_eq!(client.get_pending_admin(), Some(next));
+}
+
 #[test]
 fn test_claimable_batch_mixed_statuses_preserves_order() {
     let (env, client) = setup();

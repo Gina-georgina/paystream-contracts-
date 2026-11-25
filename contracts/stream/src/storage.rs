@@ -100,6 +100,59 @@ pub fn get_max_batch_size(env: &Env) -> u32 {
         .unwrap_or(DEFAULT_MAX_BATCH_SIZE)
 }
 
+/// Persists the protocol fee paid upfront for `stream_id`, extending its TTL.
+pub fn set_stream_fee_paid(env: &Env, stream_id: u64, fee: i128) {
+    let key = crate::DataKey::StreamFeePaid(stream_id);
+    env.storage().persistent().set(&key, &fee);
+    env.storage().persistent().extend_ttl(
+        &key,
+        crate::PERSISTENT_TTL_THRESHOLD,
+        crate::PERSISTENT_TTL_EXTEND_TO,
+    );
+}
+
+/// Returns the protocol fee recorded as paid for `stream_id`, if any.
+pub fn get_stream_fee_paid(env: &Env, stream_id: u64) -> Option<i128> {
+    let key = crate::DataKey::StreamFeePaid(stream_id);
+    let fee: Option<i128> = env.storage().persistent().get(&key);
+    if fee.is_some() {
+        env.storage().persistent().extend_ttl(
+            &key,
+            crate::PERSISTENT_TTL_THRESHOLD,
+            crate::PERSISTENT_TTL_EXTEND_TO,
+        );
+    }
+    fee
+}
+
+/// Clears the recorded protocol fee for `stream_id` so it cannot be refunded twice.
+pub fn clear_stream_fee_paid(env: &Env, stream_id: u64) {
+    let key = crate::DataKey::StreamFeePaid(stream_id);
+    env.storage().persistent().remove(&key);
+}
+
+/// Computes the employer's proportional share of `fee_paid` for the unstreamed
+/// portion of a stream.
+///
+/// `remaining` is the unstreamed deposit and `total` the original deposit. The
+/// result is rounded down and clamped to `fee_paid`, so the treasury never
+/// refunds more than it received. Returns `0` when `total` is zero.
+pub fn compute_fee_refund(fee_paid: i128, remaining: i128, total: i128) -> i128 {
+    if fee_paid <= 0 || remaining <= 0 || total <= 0 {
+        return 0;
+    }
+    let remaining = if remaining > total { total } else { remaining };
+    let share = fee_paid
+        .checked_mul(remaining)
+        .map(|v| v / total)
+        .unwrap_or(0);
+    if share > fee_paid {
+        fee_paid
+    } else {
+        share
+    }
+}
+
 /// Returns true when at least `DRAIN_TIMELOCK_SECONDS` have elapsed since the proposal.
 pub fn drain_timelock_elapsed(env: &Env, proposal: &EmergencyDrainProposal) -> bool {
     let now = env.ledger().timestamp();
@@ -145,5 +198,49 @@ mod version_tests {
         let env = Env::default();
         env.storage().instance().set(&crate::DataKey::Version, &2u32);
         assert_version_upgrade(&env, 3);
+    }
+}
+
+#[cfg(test)]
+mod fee_refund_tests {
+    use super::*;
+
+    #[test]
+    fn full_unstreamed_refunds_entire_fee() {
+        assert_eq!(compute_fee_refund(100, 1_000, 1_000), 100);
+    }
+
+    #[test]
+    fn partial_unstreamed_refunds_proportionally() {
+        // Half the deposit remains unstreamed -> half the fee is refunded.
+        assert_eq!(compute_fee_refund(100, 500, 1_000), 50);
+        // A quarter remains -> a quarter of the fee.
+        assert_eq!(compute_fee_refund(100, 250, 1_000), 25);
+    }
+
+    #[test]
+    fn nothing_unstreamed_refunds_nothing() {
+        assert_eq!(compute_fee_refund(100, 0, 1_000), 0);
+    }
+
+    #[test]
+    fn refund_never_exceeds_fee_paid() {
+        // Remaining greater than total is clamped to total.
+        assert_eq!(compute_fee_refund(100, 2_000, 1_000), 100);
+    }
+
+    #[test]
+    fn zero_total_refunds_nothing() {
+        assert_eq!(compute_fee_refund(100, 500, 0), 0);
+    }
+
+    #[test]
+    fn fee_paid_roundtrip_and_clear() {
+        let env = Env::default();
+        assert_eq!(get_stream_fee_paid(&env, 7), None);
+        set_stream_fee_paid(&env, 7, 42);
+        assert_eq!(get_stream_fee_paid(&env, 7), Some(42));
+        clear_stream_fee_paid(&env, 7);
+        assert_eq!(get_stream_fee_paid(&env, 7), None);
     }
 }

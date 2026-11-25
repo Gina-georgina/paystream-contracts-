@@ -131,6 +131,45 @@ pub fn validate_rate(rate: i128) {
     assert!(rate <= MAX_RATE_PER_SECOND, "{}", ERR_INVALID_RATE);
 }
 
+/// Validate a stop-time update for a single stream.
+///
+/// Shared by `update_stop_time` and `update_stop_time_batch` so both paths
+/// apply identical rules.
+///
+/// # Panics
+/// - E003 if the stream is not `Active`
+/// - E022 if `new_stop_time` is non-zero and earlier than `last_withdraw_time`
+pub fn validate_stop_time_update(
+    status: crate::types::StreamStatus,
+    last_withdraw_time: u64,
+    new_stop_time: u64,
+) {
+    use crate::types::{ERR_STOP_TIME_PAST, ERR_STREAM_NOT_ACTIVE};
+
+    assert!(
+        status == crate::types::StreamStatus::Active,
+        "{}",
+        ERR_STREAM_NOT_ACTIVE
+    );
+    if new_stop_time > 0 {
+        assert!(
+            new_stop_time >= last_withdraw_time,
+            "{}",
+            ERR_STOP_TIME_PAST
+        );
+    }
+}
+
+/// Validate the length of a batch entrypoint argument.
+///
+/// # Panics
+/// - E044 if `len` is outside the allowed range `1..=max`
+pub fn validate_batch_len(len: u32, max: u32) {
+    use crate::types::ERR_BATCH_LEN_INVALID;
+
+    assert!(len >= 1 && len <= max, "{}", ERR_BATCH_LEN_INVALID);
+}
+
 /// Validate split stream beneficiary configuration.
 ///
 /// # Panics

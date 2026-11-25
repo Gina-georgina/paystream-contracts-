@@ -8,6 +8,13 @@ Indexer-facing record of event schema changes. **Process:** any PR that adds, re
 
 Each entry lists the event, the change (added field / renamed topic / removed field) and migration steps for indexers.
 
+### v1.2 (2026-10-11) — proportional fee refund and batched stop-time updates
+
+| Event | Change | Migration |
+|-------|--------|-----------|
+| `cancelled` | Added field `fee_refund` (i128) at data[2] | Treat missing `fee_refund` as `0` for events emitted before v1.2 |
+| `stop_upd` | Now also emitted once per stream by `update_stop_time_batch` (topic `["v1", "stop_upd", <stream_id>]`, data `[stop_time]`); payload unchanged | No change needed; indexers already handling `stop_upd` will see additional emissions |
+
 ### v1.1 (2026-10-04) — stream metadata and split vest streams
 
 | Event | Change | Migration |
@@ -187,12 +194,14 @@ Emitted when a stream is cancelled, recording the exact cash-flow split.
 **Data**:
 - `claimable_amount` (i128): Tokens paid to the employee at cancellation time
 - `refund_amount` (i128): Tokens returned to the employer (unstreamed portion)
+- `fee_refund` (i128): Protocol fee refunded to the employer, proportional to the
+  unstreamed deposit (SC-68). `0` when no fee was charged or nothing was unstreamed.
 
 **Example**:
 ```json
 {
   "topic": ["v1", "cancelled", 1],
-  "data": [300000, 700000]
+  "data": [300000, 700000, 3500]
 }
 ```
 
@@ -291,6 +300,28 @@ Emitted when a stream's rate_per_second is changed.
 {
   "topic": ["v1", "rate_upd", 1],
   "data": [1000000, 2000000]
+}
+```
+
+---
+
+### stop_time_updated
+
+Emitted when a stream's stop time is changed via `update_stop_time` or
+`update_stop_time_batch` (SC-63). The batch entrypoint emits one event per
+stream in the batch; the batch is all-or-nothing, so either every stream in
+the batch emits this event or none do.
+
+**Topic**: `["v1", "stop_upd", <stream_id>]`
+
+**Data**:
+- `stop_time` (u64): The new stop time (0 clears the stop time)
+
+**Example**:
+```json
+{
+  "topic": ["v1", "stop_upd", 1],
+  "data": [1767225600]
 }
 ```
 
