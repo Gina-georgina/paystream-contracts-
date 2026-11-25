@@ -2389,6 +2389,22 @@ impl StreamContract {
         events::upgrade_cancelled(&env);
     }
 
+    /// Return the pending upgrade proposal, if one has been raised.
+    ///
+    /// Returns `Some((wasm_hash, unlock_time))` when a [`propose_upgrade`] call
+    /// is awaiting its timelock, or `None` when no upgrade is in flight.
+    /// Read-only; no authentication required.
+    ///
+    /// Use this during the upgrade runbook to verify the queued hash and
+    /// unlock time before calling [`execute_upgrade`].
+    ///
+    /// # Returns
+    /// `Some((BytesN<32>, u64))` — the queued WASM hash and the earliest
+    /// timestamp at which `execute_upgrade` will succeed, or `None`.
+    pub fn get_pending_upgrade(env: Env) -> Option<(soroban_sdk::BytesN<32>, u64)> {
+        get_pending_upgrade(&env).map(|p| (p.wasm_hash, p.unlock_time))
+    }
+
     /// No-op migration hook called by the admin after an upgrade.
     ///
     /// Confirms the new WASM is operational and the admin key is still valid.
