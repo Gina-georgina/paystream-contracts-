@@ -56,6 +56,9 @@ Every `DataKey` variant in `contracts/stream/src/types.rs`, in declaration order
 | `SplitBeneficiaries(u64)` | `Vec<SplitBeneficiary>` | Persistent | Extended on read/write (1y → 2y) | Split stream creation (PROD-22) | Split withdrawals |
 | `StreamMetadata(u64)` | `Map<Symbol, String>` | Persistent | Extended on read/write (1y → 2y) | `create_stream` / `update_stream_metadata` (bounded, cap enforced) | `get_stream_metadata` |
 | `MaxBatchSize` | `u32` | Instance | Instance | `set_max_batch_size` (bounds `1..=200`) | All batch entry points (absent = 50) |
+| `StreamImmutable(u64)` | `bool` | Persistent | Extended on read/write (1y → 2y) | `create_stream` with `immutable = true` (SC-77) | `cancel_stream`, `pause_stream` (reject when `true`); `is_stream_immutable` (absent = `false`) |
+| `MilestoneSchedule(u64)` | `Vec<(u64, u32)>` | Persistent | Extended on read/write (1y → 2y) | Milestone stream creation (SC-78) | `claimable`, `withdraw`, `get_milestone_schedule` |
+| `RateSchedule(u64)` | `Vec<(u64, i128)>` | Persistent | Extended on read/write (1y → 2y) | `create_stream` / `update_rate_schedule` (sorted, gaps/overlaps validated) (SC-79) | `claimable`, `withdraw`, `get_rate_schedule` |
 
 > **Keep this table current.** Any PR that adds, removes, or changes a `DataKey` variant must update this table in the same PR (reviewers: check this).
 
