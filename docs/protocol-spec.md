@@ -115,6 +115,22 @@ Effect: `D` tokens move from employer to the protocol. A new `S` is stored with 
 
 `createSplit(employer, employee, token, D, r, stop, splits, metadata)` is the same operation with the additional requirements that `splits` is valid per §2.2 and `metadata` satisfies the caps in §2.1. It is available for payroll streams and for linear vest streams; the vest variant (`createSplitVest`) additionally requires `stop > t` and applies the same split rules to vesting claimable amounts.
 
+```mermaid
+sequenceDiagram
+    actor E as Employer
+    participant C as PayStream
+    participant T as Token
+    E->>C: create(employer, employee, token, D, r, stop)
+    C->>C: check auth(employer), ¬paused, D ≥ minDeposit, D > 0, r > 0, stop = 0 ∨ stop > t
+    alt rejected
+        C-->>E: ⊥ (no state change)
+    else accepted
+        C->>T: transfer(D) from employer to protocol
+        C->>C: store S {W=0, B=0, start=last=t, status=Active}
+        C-->>E: stream id
+    end
+```
+
 ### 4.2 Withdraw
 
 `withdraw(S)` requires `auth(S.employee)`, `¬paused`, and `S.status ∈ {Active, Exhausted}`.
@@ -122,6 +138,26 @@ Effect: `D` tokens move from employer to the protocol. A new `S` is stored with 
 Effect: let `c = claimable(S, t)`. Then `c` tokens are distributed: each split beneficiary `b` receives `share(b, S, t)` and the employee receives the remainder. `W ← W + c`, `last ← end(t)`, `B ← 0`. If `W = D`, then `status ← Exhausted`.
 
 `withdrawTo(S, to)` requires `auth(S.employee)`, `¬paused`, and `S.status ∈ {Active, Exhausted}`. It is identical to `withdraw(S)` except that the employee's portion (the remainder after split shares) is transferred to `to` instead of to `S.employee`. Split beneficiaries are unaffected and still receive their shares. The operation emits an event naming `to`. `to` need not be the employee; the employee's authorisation is what matters, so a compromised `to` cannot move funds without the employee's signature.
+
+```mermaid
+sequenceDiagram
+    actor M as Employee
+    participant C as PayStream
+    participant T as Token
+    M->>C: withdraw(S)
+    C->>C: check auth(employee), ¬paused, status ∈ {Active, Exhausted}
+    alt rejected
+        C-->>M: ⊥ (no state change)
+    else accepted
+        C->>C: c = claimable(S, t)
+        C->>T: transfer(c) to employee
+        C->>C: W ← W + c, last ← end(t), B ← 0
+        opt W = D
+            C->>C: status ← Exhausted
+        end
+        C-->>M: c
+    end
+```
 
 ### 4.3 Top up
 
@@ -146,6 +182,45 @@ Effect: let `c = claimable(S, t)`. Then `c` tokens are distributed: each split b
 
 No accrual happens between `pause` and `resume`.
 
+```mermaid
+sequenceDiagram
+    actor E as Employer
+    participant C as PayStream
+    E->>C: pause(S)
+    C->>C: check auth(employer), status = Active
+    alt rejected
+        C-->>E: ⊥ (no state change)
+    else accepted
+        C->>C: B ← earned(S, t), last ← t, status ← Paused
+        C-->>E: paused
+    end
+    Note over C: no accrual while Paused
+    E->>C: resume(S)
+    C->>C: check auth(employer), status = Paused
+    alt rejected
+        C-->>E: ⊥ (no state change)
+    else accepted
+        C->>C: last ← t, status ← Active
+        C-->>E: resumed
+    end
+```
+
+Batch pause/resume applies the same per-stream checks and effects to each stream in the batch; if any stream fails its check the whole batch is rejected (`⊥`) and no stream changes state.
+
+```mermaid
+sequenceDiagram
+    actor E as Employer
+    participant C as PayStream
+    loop for each S in batch
+        E->>C: pause(S) / resume(S)
+        C->>C: check auth(employer) and required status
+        alt any stream rejected
+            C-->>E: ⊥ (whole batch rejected, no state change)
+        end
+    end
+    C-->>E: all streams paused / resumed
+```
+
 ### 4.6 Global pause
 
 `pauseContract` / `unpauseContract` require `auth(admin)`. Effect: set `paused`. While `paused`, state-changing user operations (create, withdraw) are rejected. Reads still work and no stream fields change.
@@ -154,9 +229,41 @@ No accrual happens between `pause` and `resume`.
 
 `cancel(S)` requires `auth(S.employer)`, `status ∈ {Active, Paused}`, and `¬S.immutable`. Effect: let `c = claimable(S, t)`. The employee receives `c`, the employer receives `D − W − c`, and `status ← Cancelled`. An immutable stream can therefore only leave `Active` by becoming `Exhausted` (or by admin `expire`, §4.8).
 
+```mermaid
+sequenceDiagram
+    actor E as Employer
+    participant C as PayStream
+    participant T as Token
+    E->>C: cancel(S)
+    C->>C: check auth(employer), status ∈ {Active, Paused}
+    alt rejected
+        C-->>E: ⊥ (no state change)
+    else accepted
+        C->>C: c = claimable(S, t)
+        C->>T: transfer(c) to employee
+        C->>T: transfer(D − W − c) to employer
+        C->>C: status ← Cancelled
+        C-->>E: cancelled
+    end
+```
+
 ### 4.8 Expire
 
 `expire(S)` requires `auth(admin)`, `S.stop > 0`, `t > S.stop + G` where `G` is the grace period (7 days), `status = Active`, and `claimable(S, t) = 0`. Effect: `status ← Exhausted`.
+
+```mermaid
+sequenceDiagram
+    actor A as Admin
+    participant C as PayStream
+    A->>C: expire(S)
+    C->>C: check auth(admin), S.stop > 0, t > S.stop + G, status = Active, claimable(S, t) = 0
+    alt rejected
+        C-->>A: ⊥ (no state change)
+    else accepted
+        C->>C: status ← Exhausted
+        C-->>A: exhausted
+    end
+```
 
 ## 5. State machine
 
@@ -167,6 +274,60 @@ No accrual happens between `pause` and `resume`.
    │  └── cancel ──────┴──► Cancelled   (terminal)
    │
    └── W = D or expire ──► Exhausted    (terminal)
+```
+
+### 5.1 Core flow: create → withdraw → cancel
+
+```mermaid
+sequenceDiagram
+    actor E as Employer
+    actor M as Employee
+    participant C as PayStream
+    participant T as Token
+    E->>C: create(employer, employee, token, D, r, stop)
+    C->>T: transfer(D) from employer
+    C->>C: S {W=0, B=0, start=last=t, status=Active}
+    C-->>E: stream id
+    loop until cancelled or exhausted
+        M->>C: withdraw(S)
+        C->>C: c = claimable(S, t)
+        C->>T: transfer(c) to employee
+        C->>C: W ← W + c, last ← end(t), B ← 0
+    end
+    E->>C: cancel(S)
+    C->>C: c = claimable(S, t)
+    C->>T: transfer(c) to employee
+    C->>T: transfer(D − W − c) to employer
+    C->>C: status ← Cancelled
+```
+
+### 5.2 Linear vest path (cliff and schedule shift)
+
+For a linear vest stream the accrual is a straight line from `start` to `stop` at rate `r`, with an optional cliff: no tokens are claimable before `start + cliff`, and at the cliff the full amount accrued since `start` becomes claimable. `pause`/`resume` shift the schedule so that the remaining vesting window is preserved: `resume` moves `start` and `stop` forward by the paused duration, keeping `r` and the remaining amount unchanged.
+
+```mermaid
+sequenceDiagram
+    actor E as Employer
+    actor M as Employee
+    participant C as PayStream
+    E->>C: create(linear vest: D, r, start, stop, cliff)
+    C->>C: S {W=0, B=0, start=last=t, stop, status=Active}
+    Note over C: t < start + cliff → claimable = 0
+    M->>C: withdraw(S) before cliff
+    C-->>M: 0 (nothing claimable)
+    Note over C: t ≥ start + cliff → claimable = r · (end(t) − start) − W
+    M->>C: withdraw(S) after cliff
+    C->>C: c = claimable(S, t)
+    C-->>M: c
+    E->>C: pause(S)
+    C->>C: B ← earned(S, t), last ← t, status ← Paused
+    Note over C: paused duration Δ accrues nothing
+    E->>C: resume(S)
+    C->>C: start ← start + Δ, stop ← stop + Δ, last ← t, status ← Active
+    Note over C: remaining vesting window preserved, r unchanged
+    M->>C: withdraw(S)
+    C->>C: c = claimable(S, t)
+    C-->>M: c
 ```
 
 ## 6. Invariants
