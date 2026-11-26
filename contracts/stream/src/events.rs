@@ -39,17 +39,20 @@ pub fn stream_status_changed(env: &Env, id: u64, status: &StreamStatus) {
 ///
 /// - `claimable_amount` — tokens paid to the employee at cancellation time
 /// - `refund_amount`    — tokens returned to the employer (unstreamed portion)
+/// - `fee_refund`       — protocol fee refunded to the employer for the
+///                        unstreamed portion of the deposit (SC-68)
 /// - `cancel_reason`   — optional employer-supplied reason symbol
 pub fn stream_cancelled(
     env: &Env,
     id: u64,
     claimable_amount: i128,
     refund_amount: i128,
+    fee_refund: i128,
     cancel_reason: Option<soroban_sdk::Symbol>,
 ) {
     env.events().publish(
         (symbol_short!("v1"), symbol_short!("cancelled"), id),
-        (claimable_amount, refund_amount, cancel_reason),
+        (claimable_amount, refund_amount, fee_refund, cancel_reason),
     );
 }
 
@@ -166,6 +169,11 @@ pub fn low_balance(env: &Env, id: u64, employer: &Address, remaining: i128, thre
 }
 
 /// Emitted when `set_low_balance_threshold` updates the stream's alert threshold.
+///
+/// Also emitted once per stream by `set_low_balance_threshold_batch`, so
+/// indexers observe one event per change regardless of entrypoint used.
+///
+/// Topics: `("v1", "thresh_up", stream_id)`; data: `(old_threshold, new_threshold)`.
 pub fn threshold_updated(env: &Env, stream_id: u64, old_threshold: i128, new_threshold: i128) {
     env.events().publish(
         (symbol_short!("v1"), symbol_short!("thresh_up"), stream_id),
@@ -234,11 +242,7 @@ pub fn platform_stats(
 
 /// Emitted once, the first time a stream is touched after its cliff (PROD-17).
 ///
-/// Topics: `("v1", "cliff", stream_id)`; data: the cliff timestamp.
-pub fn cliff_reached(env: &Env, id: u64, cliff_time: u64) {
-    env.events()
-        .publish((symbol_short!("v1"), symbol_short!("cliff"), id), cliff_time);
-}
+/// Topics: `("v1", "cliff", stream_id)`; data: the cliff ti
 
 // Restored from a97bb5d (dropped by a merge).
 /// Emitted when the admin changes the per-ledger stream creation cap (SEC-24).
@@ -247,22 +251,37 @@ pub fn max_creates_per_ledger_updated(env: &Env, max: u32) {
         .publish((symbol_short!("v1"), symbol_short!("rl_upd"),), max);
 }
 
-/// Emitted on initialize/migrate to stamp the contract event schema version
-/// (SC-90). Indexers can read this to detect future event schema changes
-/// without resyncing. Topics: `("v1", "ev_ver")`; data: the version number.
-pub fn contract_event_version_set(env: &Env, version: u32) {
-    env.events()
-        .publish((symbol_short!("v1"), symbol_short!("ev_ver")), version);
+/// Emitted by `withdraw_to` when the receipt holder directs a withdrawal to a
+/// delegate recipient (SC-80). Topics: `("v1", "wd_to", id)`; data:
+/// `(employee, to, amount)`.
+pub fn withdraw_to(env: &Env, id: u64, employee: &Address, to: &Address, amount: i128) {
+    env.events().publish(
+        (symbol_short!("v1"), symbol_short!("wd_to"), id),
+        (employee.clone(), to.clone(), amount),
+    );
 }
 
-/// Emitted per bounded migrate batch to report backfill progress (SC-94).
-///
-/// - `processed` — number of legacy streams backfilled so far
-/// - `total`     — total number of legacy streams to backfill
-/// - `done`      — whether the migration has completed
-pub fn migrate_progress(env: &Env, processed: u32, total: u32, done: bool) {
+/// Emitted when a stream's forward rate schedule is created or replaced
+/// (SC-79). Data carries the number of `(timestamp, rate)` entries stored.
+pub fn rate_schedule_set(env: &Env, id: u64, entry_count: u32) {
     env.events().publish(
-        (symbol_short!("v1"), symbol_short!("mig_prog")),
-        (processed, total, done),
+        (symbol_short!("v1"), symbol_short!("rate_sch"), id),
+        entry_count,
     );
+}
+
+/// Emitted when a milestone vesting schedule is created or replaced (SC-78).
+/// Data carries the number of `(timestamp, fraction)` milestones stored.
+pub fn milestone_schedule_set(env: &Env, id: u64, milestone_count: u32) {
+    env.events().publish(
+        (symbol_short!("v1"), symbol_short!("ms_sch"), id),
+        milestone_count,
+    );
+}
+
+/// Emitted when a stream is created with the immutable flag set (SC-77),
+/// making it non-cancellable and non-pausable by the employer.
+pub fn stream_immutable(env: &Env, id: u64) {
+    env.events()
+        .publish((symbol_short!("v1"), symbol_short!("immut"), id), ());
 }

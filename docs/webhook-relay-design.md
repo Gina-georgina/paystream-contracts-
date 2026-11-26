@@ -93,10 +93,12 @@ order. Requests time out after 10 s.
 
 ## Retry logic and idempotency
 
-- **Retry:** exponential backoff with full jitter — 1 min, 5 min, 25 min, 2 h, 8 h
-  (5 attempts). HTTP `410` or repeated DNS failure ⇒ retire the webhook to `disabled` state.
-- **Dead letter:** after final failure the event is parked in a DLQ table for 30 days,
-  replayable by the owner via the API.
+- **Retry:** exponential backoff with full jitter — base delays 1 min, 5 min, 25 min, 2 h, 8 h
+  (5 attempts total, i.e. 1 initial delivery + 4 retries). The actual delay for attempt `n` is
+  `random(0, base[n])` (full jitter). HTTP `410` or repeated DNS failure ⇒ retire the webhook to
+  `disabled` state.
+- **Dead letter:** after final failure the event is parked in the `webhook_dead_letters` table
+  for 30 days, replayable by the owner via `POST /v1/webhooks/{id}/dead-letters/{dlq_id}/replay`.
 - **Non-retryable:** HTTP `4xx` other than `408`/`429` ⇒ drop after one attempt, log, count
   against the webhook's failure budget (10 consecutive drops ⇒ auto-disable + notification email).
 - **Idempotency:** at-least-once delivery. Consumers deduplicate on the `Idempotency-Key`
@@ -104,6 +106,10 @@ order. Requests time out after 10 s.
   advances only after the event is durably queued.
 - **Ordering:** best-effort per stream (single dispatcher worker per URL); across URLs no
   ordering guarantee. Documented as such.
+- **Observability:** every attempt is recorded in `webhook_delivery_attempts`
+  (`subscriber_id`, `event_id`, `attempt`, `status_code`, `response_body` (truncated),
+  `error`, `created_at`), exposed via `GET /v1/webhooks/{id}/deliveries`.
+=======
 
 ---
 
@@ -135,6 +141,9 @@ SEP-43-style, nonce-based like the contract admin nonce pattern):
 | `PATCH` | `/v1/webhooks/{id}` | Update `url` / `events` / `active` |
 | `DELETE` | `/v1/webhooks/{id}` | Remove webhook and pending deliveries |
 | `POST` | `/v1/webhooks/{id}/test` | Send a signed `ping` test event |
+| `GET` | `/v1/webhooks/{id}/deliveries` | Per-attempt delivery status (status code, response, timestamp) |
+| `GET` | `/v1/webhooks/{id}/dead-letters` | List dead-lettered events |
+| `POST` | `/v1/webhooks/{id}/dead-letters/{dlq_id}/replay` | Re-enqueue a dead-lettered event |
 
 Validation: max 10 webhooks per employer, max 100 stream subscriptions per webhook, URL length
 ≤ 2 KB. Registration triggers the SSRF check and a mandatory `ping` handshake (endpoint must
@@ -155,6 +164,25 @@ return `2xx` within 5 s) before activation.
 
 Deferred: employee-facing events, HMAC key rotation endpoint, mTLS, event replay UI, multi-relay
 horizontal sharding (single instance is sufficient at current volume).
+
+---
+
+## Implementation notes (issue #403)
+
+The v1 relay lives in `backend/src/webhooks/`:
+
+| Module | Responsibility |
+|---|---|
+| `subscribers.ts` | Subscriber registry: `url`, `secret`, `events[]` filter, `active` flag |
+| `signature.ts` | `signPayload(secret, timestamp, rawBody)` → `t=<ts>,v1=<hex>` HMAC-SHA256 |
+| `backoff.ts` | `backoffDelay(attempt)` — full-jitter exponential backoff over the base schedule |
+| `dispatcher.ts` | HTTP delivery, retry loop, dead-lettering, per-attempt recording |
+| `router.ts` | Registration + admin/status endpoints |
+
+Storage (Postgres): `webhook_subscribers`, `webhook_delivery_attempts`,
+`webhook_dead_letters`. Event routing resolves `employer` from the event data when present and
+otherwise from a cached `get_stream` lookup keyed by stream ID. `i128` amounts are serialized as
+decimal strings in the payload, matching the schema above.
 
 ---
 
