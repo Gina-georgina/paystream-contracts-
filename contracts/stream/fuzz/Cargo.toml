@@ -41,3 +41,7 @@ path = "src/fuzz_transfer_withdraw_all.rs"
 [[bin]]
 name = "prop_claimable_invariant"
 path = "src/prop_claimable_invariant.rs"
+
+[[bin]]
+name = "prop_linear_vest_pause_resume"
+path = "src/prop_linear_vest_pause_resume.rs"
