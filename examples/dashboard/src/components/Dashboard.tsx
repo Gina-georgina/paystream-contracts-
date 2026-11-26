@@ -20,6 +20,103 @@ import { formatAmount, formatRate } from "@/lib/format";
 
 type Tab = "employer" | "employee";
 
+const STORAGE_KEY = "paystream.session";
+const LOW_BALANCE_DISMISS_KEY = "paystream.lowBalanceDismissed";
+
+const FOCUSABLE_SELECTOR =
+  'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+/**
+ * Reusable focus-trap hook for modals/dialogs.
+ *
+ * While `active` is true, Tab/Shift+Tab are constrained to the focusable
+ * elements inside `containerRef`, and focus is moved into the container.
+ * When the trap deactivates, focus is restored to the element that was
+ * focused before the trap engaged.
+ */
+export function useFocusTrap(
+  containerRef: React.RefObject<HTMLElement | null>,
+  active: boolean,
+) {
+  useEffect(() => {
+    if (!active) return;
+    const container = containerRef.current;
+    if (!container) return;
+
+    const previouslyFocused = document.activeElement as HTMLElement | null;
+
+    const getFocusable = () =>
+      Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
+        (el) => el.offsetParent !== null || el === document.activeElement,
+      );
+
+    const focusables = getFocusable();
+    (focusables[0] ?? container).focus();
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Tab") return;
+      const items = getFocusable();
+      if (items.length === 0) {
+        event.preventDefault();
+        container.focus();
+        return;
+      }
+      const first = items[0];
+      const last = items[items.length - 1];
+      const current = document.activeElement as HTMLElement | null;
+
+      if (event.shiftKey) {
+        if (current === first || !container.contains(current)) {
+          event.preventDefault();
+          last.focus();
+        }
+      } else if (current === last || !container.contains(current)) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    container.addEventListener("keydown", onKeyDown);
+    return () => {
+      container.removeEventListener("keydown", onKeyDown);
+      if (previouslyFocused && typeof previouslyFocused.focus === "function") {
+        previouslyFocused.focus();
+      }
+    };
+  }, [containerRef, active]);
+}
+
+type PersistedSession = { address: string; tab: Tab };
+
+function readPersistedSession(): PersistedSession | null {
+  try {
+    const raw = window.localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<PersistedSession>;
+    if (typeof parsed.address !== "string" || !parsed.address) return null;
+    const tab: Tab = parsed.tab === "employee" ? "employee" : "employer";
+    return { address: parsed.address, tab };
+  } catch {
+    return null;
+  }
+}
+
+function clearPersistedSession() {
+  try {
+    window.localStorage.removeItem(STORAGE_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
+function writePersistedSession(session: PersistedSession) {
+  try {
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(session));
+  } catch {
+    /* ignore */
+  }
+}
+
 export default function Dashboard() {
   const t = useTranslations("Dashboard");
   const locale = useLocale();
@@ -155,8 +252,15 @@ export default function Dashboard() {
     .filter((s) => s.status_label === "Active")
     .reduce((sum, s) => sum + s.claimable, 0n);
 
+  const lowBalanceStreams = employerStreams.filter(
+    (s) => s.status_label === "Active" && s.remaining < s.low_balance_threshold,
+  );
+
   return (
-    <main>
+    <main id="main-content">
+      <a href="#main-content" className="skip-link">
+        Skip to content
+      </a>
       <header>
         <div>
           <h1>{t("title")}</h1>
@@ -340,8 +444,37 @@ function StreamTable({
               </td>
             )}
           </tr>
-        ))}
-      </tbody>
-    </table>
+        </thead>
+        <tbody>
+          {streams.map((s) => (
+            <tr key={s.id.toString()} id={`stream-${s.id.toString()}`}>
+              <td data-label="ID" className="sticky-col">
+                {s.id.toString()}
+              </td>
+              <td data-label={tab === "employer" ? "Employee" : "Employer"}>
+                <code>{shortAddr(tab === "employer" ? s.employee : s.employer)}</code>
+              </td>
+              <td data-label="Status">
+                <span className={`pill ${s.status_label}`}>{s.status_label}</span>
+              </td>
+              <td data-label="Claimable">{formatAmount(s.claimable)}</td>
+              <td data-label="Burn rate">
+                {s.status_label === "Active" ? `${formatAmount(s.rate_per_second)}/s` : "—"}
+              </td>
+              {tab === "employee" && (
+                <td data-label="Actions" style={{ textAlign: "right" }}>
+                  <button
+                    onClick={() => onWithdraw(s.id)}
+                    disabled={s.status_label !== "Active" || s.claimable <= 0n || busyId !== null}
+                  >
+                    {busyId === s.id.toString() ? "…" : "Withdraw"}
+                  </button>
+                </td>
+              )}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }
