@@ -24,13 +24,16 @@ One card per employer address. Totals are per token — never sum amounts across
 | `streams_by_status` | `map<StreamStatus, u64>` | Count of Active / Paused / Cancelled / Exhausted | `get_streams_batch(stream_ids)` → group by `status` | Derived |
 | `total_deposited[token]` | `i128` | Σ `deposit` over the employer's streams | `get_streams_batch` → Σ `deposit` | Derived |
 | `total_withdrawn[token]` | `i128` | Σ `withdrawn` over the employer's streams | `get_streams_batch` → Σ `withdrawn` | Derived |
-| `total_claimable[token]` | `i128` | Σ currently claimable over Active streams | `claimable(id)` per Active stream | Direct (N calls) |
+| `total_claimable[token]` | `i128` | Σ currently claimable over Active streams | `total_claimable_by_employee(employee)` per employee, or `claimable(id)` per Active stream | Direct |
 | `total_refunded[token]` | `i128` | Σ refunds returned on cancellation | `cancelled` events → Σ `refund_amount` | Indexed |
+| `total_locked[token]` | `i128` | Σ (`deposit` − `withdrawn`) over the employer's Active streams | `total_locked_by_employer(employer)` | Direct |
 | `total_remaining[token]` | `i128` | Unstreamed escrow still locked: Σ (`deposit` − `withdrawn` − `claimable`) over Active/Paused streams | Derived from the rows above | Derived |
 | `burn_rate[token]` | `i128` / s | Σ `rate_per_second` over Active streams | `get_streams_batch` → Σ `rate_per_second` | Derived |
 | `low_balance_alerts` | `Vec<u64>` | Streams that emitted `low_bal` and have not been topped up since | `low_bal` events minus later `topup` events | Indexed |
 
 > `get_streams_batch` is capped at 50 IDs per call — page through `stream_ids` in chunks of 50.
+>
+> The aggregate queries `total_claimable_by_employee` and `total_locked_by_employer` are read-only and iterate the address's streams on-chain, so they are bounded: they error once an address exceeds the contract's iteration limit. For addresses past that limit, fall back to paging `stream_ids` and summing client-side (or use an indexer).
 
 ---
 
@@ -46,7 +49,7 @@ One row per stream in the employer's stream table.
 | `status` | `StreamStatus` | Active / Paused / Cancelled / Exhausted | `Stream.status` or `stream_status(id)` | Direct |
 | `deposit` | `i128` | Total deposited incl. top-ups | `Stream.deposit` | Direct |
 | `withdrawn` | `i128` | Total paid out to the employee | `Stream.withdrawn` | Direct |
-| `claimable` | `i128` | Earned but not yet withdrawn | `claimable(id)` | Direct |
+| `claimable` | `i128` | Earned but not yet withdrawn | `claimable(id)` or `stream_summary(id).claimable` | Direct |
 | `remaining` | `i128` | `deposit − withdrawn − claimable` | Derived | Derived |
 | `rate_per_second` | `i128` | Current rate | `Stream.rate_per_second` | Direct |
 | `start_time` | `u64` | Stream start | `Stream.start_time` | Direct |
@@ -59,6 +62,8 @@ One row per stream in the employer's stream table.
 | `last_activity` | `u64` | Most recent event of any kind | Latest event for `id` | Indexed |
 
 **Recommended read path:** `stream_ids_by_employer` → `get_streams_batch` (chunks of 50) → `claimable` for Active streams only (the others are always 0 or fixed).
+
+**Polling read path:** for indexers and dashboards polling many streams, prefer `stream_summary(id)` over `get_stream(id)`. It returns a small struct with only `id`, `status`, `claimable`, `remaining`, and `rate` — cheaper to simulate and decode than the full `Stream`. Use `get_stream` only when fields outside the summary (e.g. `employee`, `token`, `start_time`) are needed.
 
 ---
 
@@ -98,7 +103,10 @@ Contract storage keeps only the current state, so all history comes from events 
 |---|---|---|---|
 | Stream list for an employer | ✅ `stream_ids_by_employer` | | On-chain index exists |
 | Current state of each stream | ✅ `get_stream` / `get_streams_batch` | | Stored on-chain |
+| Lightweight per-stream polling (id, status, claimable, remaining, rate) | ✅ `stream_summary` | | Small struct, cheaper than `get_stream` |
 | Current / future claimable | ✅ `claimable`, `claimable_at` | | Computed on-chain |
+| Employee claimable total | ✅ `total_claimable_by_employee` | | On-chain aggregate; bounded iteration, errors past the limit |
+| Employer locked total (deposit − withdrawn, Active) | ✅ `total_locked_by_employer` | | On-chain aggregate; bounded iteration, errors past the limit |
 | Overview totals (deposited, withdrawn, claimable, burn rate) | ✅ via reads + client sum | | Small N; sum client-side. Use an indexer when N is large (≫ 50 streams) |
 | Refund totals | | ✅ | Refund amount exists only in `cancelled` events |
 | Any historical or time-series chart | | ✅ | Storage keeps only current state |

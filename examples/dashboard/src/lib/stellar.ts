@@ -176,6 +176,16 @@ export const withdraw = (employee: string, streamId: bigint) =>
 export const withdrawAll = (employee: string) =>
   invoke("withdraw_all", addr(employee)) as Promise<[bigint, bigint][]>;
 
+/** Read the contract's minimum deposit (base units) for validating new streams. */
+export async function getMinDeposit(source: string): Promise<bigint> {
+  return (await read(source, "get_min_deposit")) as bigint;
+}
+
+/** Read whether the contract is paused; new streams should be blocked when true. */
+export async function getPaused(source: string): Promise<boolean> {
+  return (await read(source, "get_paused")) as boolean;
+}
+
 // --- Wallet + formatting helpers ---
 
 export async function ensureConnected(): Promise<string> {

@@ -24,6 +24,8 @@ pub enum StreamType {
     Payroll,
     /// A fixed grant becomes claimable linearly over a vesting period.
     LinearVest,
+    /// A fixed grant becomes claimable in discrete milestones over time.
+    Milestone,
 }
 
 /// A salary stream: employer deposits funds, employee withdraws per-second.
@@ -60,6 +62,28 @@ pub struct Stream {
     pub low_balance_threshold: i128,
     /// Optional reason for pausing the stream (regulatory compliance and dispute resolution).
     pub pause_reason: Option<soroban_sdk::String>,
+    /// Whether the stream is immutable (non-cancellable, non-pausable by the
+    /// employer). Funds remain withdrawable by the employee. See #445.
+    pub immutable: bool,
+}
+
+/// Lightweight projection of a stream for indexers polling many streams.
+///
+/// Contains only the fields needed to display status and balances, avoiding
+/// the cost of returning the full [`Stream`] struct. See #424.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct StreamSummary {
+    /// Unique sequential stream identifier.
+    pub id: u64,
+    /// Current lifecycle state.
+    pub status: StreamStatus,
+    /// Tokens currently claimable by the employee.
+    pub claimable: i128,
+    /// Tokens still remaining in the stream's deposit.
+    pub remaining: i128,
+    /// Payroll rate in tokens per second; zero for linear vest streams.
+    pub rate: i128,
 }
 
 /// Cold (rarely-read) stream fields relocated out of the hot `Stream` entry
@@ -87,6 +111,50 @@ pub struct LinearVestSchedule {
     pub vest_period: u64,
     /// Optional duration before accrued vesting becomes claimable.
     pub cliff: Option<u64>,
+}
+
+/// A single milestone in a milestone-based vesting schedule (#446).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Milestone {
+    /// Ledger timestamp at which this milestone vests.
+    pub timestamp: u64,
+    /// Fraction of the grant that vests at this milestone, in basis points
+    /// (10000 = 100%). Fractions across all milestones must sum to 10000.
+    pub fraction_bps: u32,
+}
+
+/// Milestone-based vesting terms stored separately so existing persisted
+/// `Stream` values remain decodable (#446).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MilestoneSchedule {
+    /// Net grant amount available over the schedule.
+    pub total_grant: i128,
+    /// Optional cliff timestamp before which nothing vests.
+    pub cliff: Option<u64>,
+    /// Sorted (ascending by timestamp) list of milestones.
+    pub milestones: soroban_sdk::Vec<Milestone>,
+}
+
+/// A single entry in a forward rate schedule (#447).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RateScheduleEntry {
+    /// Ledger timestamp at which this rate becomes active.
+    pub timestamp: u64,
+    /// Payroll rate in tokens per second from this timestamp onward.
+    pub rate_per_second: i128,
+}
+
+/// Forward rate schedule stored separately so existing persisted `Stream`
+/// values remain decodable (#447). Entries are sorted ascending by timestamp
+/// with no gaps or overlaps.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RateSchedule {
+    /// Sorted (ascending by timestamp) list of rate changes.
+    pub entries: soroban_sdk::Vec<RateScheduleEntry>,
 }
 
 /// Parameters for a single stream in a batch create call.
@@ -234,6 +302,13 @@ pub enum DataKey {
     /// Admin-configurable maximum batch size for batch entrypoints.
     /// Default: `MAX_BATCH_SIZE` (50). Bounded to 1..=200. See #483.
     MaxBatchSize,
+    /// Immutable/locked flag for a stream (#445): stream ID → bool. Stored
+    /// apart from `Stream` so existing persisted streams stay decodable.
+    StreamImmutable(u64),
+    /// Milestone vesting schedule for a stream (#446).
+    MilestoneSchedule(u64),
+    /// Forward rate schedule for a stream (#447).
+    RateSchedule(u64),
 }
 
 /// Contract error codes – panic messages reference these names so callers can
@@ -358,6 +433,25 @@ pub const ERR_METADATA_ENTRY_TOO_LONG: &str = "E037: metadata key or value excee
 
 /// E038: configured max batch size is outside the allowed bounds (#483).
 pub const ERR_INVALID_MAX_BATCH_SIZE: &str = "E038: max batch size out of bounds";
+
+/// E039: operation rejected because the stream is immutable (#445).
+pub const ERR_IMMUTABLE_STREAM: &str = "E039: stream is immutable";
+
+/// E040: milestone schedule is invalid (empty, unsorted, or fractions do not
+/// sum to 10000) (#446).
+pub const ERR_MILESTONE_SCHEDULE_INVALID: &str = "E040: invalid milestone schedule";
+
+/// E041: rate schedule is invalid (empty or contains non-positive rates) (#447).
+pub const ERR_RATE_SCHEDULE_INVALID: &str = "E041: invalid rate schedule";
+
+/// E042: rate schedule contains a gap between entries (#447).
+pub const ERR_RATE_SCHEDULE_GAP: &str = "E042: rate schedule contains a gap";
+
+/// E043: rate schedule contains overlapping or unsorted entries (#447).
+pub const ERR_RATE_SCHEDULE_OVERLAP: &str = "E043: rate schedule contains an overlap";
+
+/// E044: withdraw_to recipient is invalid (e.g. the contract itself) (#448).
+pub const ERR_WITHDRAW_TO_INVALID: &str = "E044: invalid withdraw_to recipient";
 
 /// E030: stop_time extends beyond 10-year limit from now
 pub const ERR_STOP_TIME_TOO_FAR: &str = "E030: stop_time must not exceed 10 years from now";
