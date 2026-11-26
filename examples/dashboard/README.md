@@ -5,7 +5,8 @@ salary streams from **Stellar testnet** and lets an employee withdraw. It is a
 working integration example for the data model in
 [`docs/dashboard-data-model.md`](../../docs/dashboard-data-model.md) and the call
 patterns in [`docs/client-guide.md`](../../docs/client-guide.md) — it is kept
-separate from the `contracts/` workspace and is not part of the Rust build or CI.
+separate from the `contracts/` workspace and is not part of the Rust build, but
+it does have its own CI workflow (see [CI](#ci) below).
 
 ## Features
 
@@ -66,9 +67,36 @@ npm run dev                  # http://localhost:3000
 | Command | Description |
 |---|---|
 | `npm run dev` | Start the dev server. |
-| `npm run build` | Production build. |
+| `npm run build` | Production build (`next build`). |
 | `npm run start` | Serve the production build. |
+| `npm run lint` | ESLint check. |
 | `npm run typecheck` | TypeScript check (`tsc --noEmit`). |
+| `npm run test:e2e` | End-to-end suite against the testnet sandbox. |
+
+## CI
+
+The dashboard has its own GitHub Actions workflow,
+[`dashboard-ci.yml`](../../.github/workflows/dashboard-ci.yml), which runs on
+pull requests and pushes that touch `examples/dashboard`. It has two jobs:
+
+- **build** — installs dependencies, then runs `npm run typecheck`,
+  `npm run lint`, and `npm run build` (`next build`). Type or build errors fail
+  the PR.
+- **e2e** — reuses the same testnet sandbox setup as the contract e2e tests
+  (deploy + init scripts) and runs `npm run test:e2e` against it.
+
+Both jobs cache npm dependencies (keyed on `examples/dashboard/package-lock.json`),
+so repeat runs skip the full install. Run the same commands locally before
+opening a PR:
+
+```bash
+cd examples/dashboard
+npm ci
+npm run typecheck
+npm run lint
+npm run build
+npm run test:e2e   # requires the testnet sandbox (deploy-testnet.sh / init-testnet.sh)
+```
 
 ## Notes
 

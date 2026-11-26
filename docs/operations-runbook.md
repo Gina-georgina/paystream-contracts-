@@ -149,6 +149,84 @@ stellar contract invoke --id "$STREAM_ID" --source "$ADMIN" --network "$NETWORK"
 stellar contract invoke --id "$STREAM_ID" --source "$ADMIN" --network "$NETWORK" -- version
 ```
 
+## 6. Indexer event ingestion (idempotency & replay protection)
+
+The indexer must never double-count events when a ledger is reprocessed or the process restarts. Ingestion is idempotent and resumable.
+
+### 6.1 Persistence schema
+
+```sql
+-- One row per on-chain event. The unique key makes ingestion idempotent.
+CREATE TABLE events (
+    id               BIGSERIAL PRIMARY KEY,
+    contract_id      TEXT    NOT NULL,
+    ledger_sequence  BIGINT  NOT NULL,
+    event_index      INTEGER NOT NULL,   -- position within the ledger
+    payload          JSONB   NOT NULL,
+    ingested_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (contract_id, ledger_sequence, event_index)
+);
+
+-- Monotonic high-water-mark, one row per contract.
+CREATE TABLE ingestion_state (
+    contract_id           TEXT   PRIMARY KEY,
+    last_processed_ledger BIGINT NOT NULL
+);
+```
+
+Writes use `INSERT ... ON CONFLICT DO NOTHING`, so replaying a ledger is a no-op for events already stored:
+
+```sql
+INSERT INTO events (contract_id, ledger_sequence, event_index, payload)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (contract_id, ledger_sequence, event_index) DO NOTHING;
+```
+
+### 6.2 High-water-mark semantics
+
+- `ingestion_state.last_processed_ledger` is the highest ledger that has been **fully** ingested for the contract.
+- It is advanced **monotonically only** — the update never moves it backwards:
+
+  ```sql
+  INSERT INTO ingestion_state (contract_id, last_processed_ledger)
+  VALUES ($1, $2)
+  ON CONFLICT (contract_id) DO UPDATE
+    SET last_processed_ledger = GREATEST(ingestion_state.last_processed_ledger, EXCLUDED.last_processed_ledger);
+  ```
+
+- The event insert and the high-water-mark update for a ledger run in the **same transaction**, so the mark never claims a ledger whose events were not persisted.
+
+### 6.3 Dedupe buffer (out-of-order delivery)
+
+Before any DB write, events pass through an in-memory buffer keyed by `contract_id:ledger_sequence:event_index` (bounded LRU set). This absorbs duplicate and out-of-order delivery within a batch window. The DB unique constraint remains the source of truth; the buffer is only a fast pre-filter and may be safely dropped on restart.
+
+### 6.4 Restart / resume behavior
+
+On startup the indexer reads the persisted high-water-mark:
+
+- If a row exists for the contract, ingestion resumes at `last_processed_ledger + 1`.
+- If no row exists (first run), ingestion starts at the configured start ledger.
+
+Because reprocessing is idempotent, resuming from `last_processed_ledger` (rather than `+ 1`) is also safe; the overlap is deduplicated by the unique constraint.
+
+```bash
+# Inspect progress
+psql "$DATABASE_URL" -c "SELECT * FROM ingestion_state;"
+
+# Verify no duplicates exist for a ledger
+psql "$DATABASE_URL" -c \
+  "SELECT ledger_sequence, event_index, count(*) FROM events
+   GROUP BY 1,2 HAVING count(*) > 1;"
+```
+
+### 6.5 Ingestion tests
+
+The indexer test suite covers:
+
+- **Reprocess same ledger** — ingesting a ledger twice inserts each event once.
+- **Restart mid-stream** — a fresh process resumes from the persisted high-water-mark with no loss.
+- **Out-of-order delivery** — events delivered out of order are stored once and the high-water-mark advances monotonically.
+
 ## Common errors and recovery
 
 | Error | Cause | Recovery |

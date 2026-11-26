@@ -32,7 +32,7 @@ use storage::{
     set_protocol_fee,
     check_and_increment_create_rate, get_stream_ended_at, load_stream_any, set_split_beneficiaries,
     ARCHIVE_WAIT_PERIOD, GRACE_PERIOD, SECONDS_PER_DAY, get_linear_vest_schedule, get_protocol_fee, get_stream_type, linear_vest_claimable_amount, set_linear_vest_schedule, set_stream_ended_at, set_max_creates_per_ledger as store_max_creates,
-    accrual_start, claimable_amount, clear_pending_admin, clear_pending_upgrade,
+    accrual_start, active_rate_at, claimable_amount, clear_pending_admin, clear_pending_upgrade,
     consume_admin_nonce, delete_template, get_admin, get_admin_nonce, get_auto_topup,
     get_employee_streams, get_employer_streams, get_max_batch_size, get_min_deposit, get_pending_admin,
     get_pending_admin_nonce, get_pending_upgrade, get_split_beneficiaries, get_stream_cliff, get_stream_metadata, get_streams_in_range,
@@ -42,6 +42,8 @@ use storage::{
     remove_employer_stream, save_stream, save_template, set_admin, set_auto_topup, set_max_batch_size, set_min_deposit,
     set_pending_admin, set_pending_admin_nonce, set_pending_upgrade, set_receipt_owner,
     set_stream_cliff, set_stream_metadata, stream_ids_by_employee, stream_ids_by_employer, TIMELOCK_DELAY,
+    get_milestone_schedule, set_milestone_schedule, milestone_claimable_amount,
+    get_rate_schedule, set_rate_schedule, get_stream_immutable, set_stream_immutable,
 };
 use types::{
     AutoTopupConfig, PendingUpgrade, SplitBeneficiary,
@@ -54,10 +56,13 @@ use types::{
     ERR_REENTRANT, ERR_STREAM_ALREADY_ENDED, ERR_STREAM_CANCELLED, ERR_STREAM_EXHAUSTED,
     ERR_STREAM_NOT_ACTIVE, ERR_STREAM_NOT_FOUND, ERR_STREAM_NOT_PAUSED, ERR_ZERO_DEPOSIT,
     ERR_NOT_RECEIPT_OWNER, ERR_TEMPLATE_NOT_FOUND,
+    ERR_IMMUTABLE_STREAM, ERR_INVALID_MILESTONE_SCHEDULE, ERR_INVALID_RATE_SCHEDULE,
+    ERR_INVALID_WITHDRAW_TO,
 };
 use validate::{
     validate_cliff, validate_create_stream, validate_metadata, validate_rate,
-    validate_split_beneficiaries, validate_top_up,
+    validate_split_beneficiaries, validate_top_up, validate_milestone_schedule,
+    validate_rate_schedule, validate_withdraw_to,
 };
 
 fn get_paused(env: &Env) -> bool {
@@ -77,20 +82,26 @@ fn protocol_fee_amount(deposit: i128, fee_bps: u32) -> i128 {
 }
 
 fn stream_claimable_amount(env: &Env, stream: &Stream, now: u64) -> i128 {
-    match get_linear_vest_schedule(env, stream.id) {
-        Some(schedule) => linear_vest_claimable_amount(stream, &schedule, now),
-        None => claimable_amount(stream, now),
+    match get_stream_type(env, stream.id) {
+        StreamType::Milestone => {
+            let schedule = get_milestone_schedule(env, stream.id).unwrap_or_default();
+            milestone_claimable_amount(stream, &schedule, now)
+        }
+        StreamType::LinearVest => match get_linear_vest_schedule(env, stream.id) {
+            Some(schedule) => linear_vest_claimable_amount(stream, &schedule, now),
+            None => claimable_amount(stream, now),
+        },
+        StreamType::Payroll => claimable_amount(stream, now),
     }
 }
 
-/// Enforces the 10-year cap on `stop_time` (SC-65). A zero `stop_time` means
-/// "no hard stop" and is always allowed.
-fn validate_stop_time_cap(stop_time: u64, now: u64) {
-    if stop_time == 0 {
-        return;
-    }
-    let max_stop_time = now.saturating_add(MAX_STOP_TIME_OFFSET);
-    assert!(stop_time <= max_stop_time, "{}", ERR_STOP_TIME_TOO_FAR);
+/// Panics with `ERR_IMMUTABLE_STREAM` when the stream was created immutable.
+fn assert_not_immutable(env: &Env, stream_id: u64) {
+    assert!(
+        !get_stream_immutable(env, stream_id),
+        "{}",
+        ERR_IMMUTABLE_STREAM
+    );
 }
 
 fn assert_payroll_stream(env: &Env, stream_id: u64) {
@@ -429,10 +440,19 @@ impl StreamContract {
         low_balance_threshold: Option<i128>,
         cliff_time: Option<u64>,
         metadata: Option<Map<Symbol, Symbol>>,
+        immutable: bool,
+        milestone_schedule: Option<Vec<(u64, u32)>>,
+        rate_schedule: Option<Vec<(u64, i128)>>,
     ) -> u64 {
         employer.require_auth();
         assert!(!get_paused(&env), "{}", ERR_CONTRACT_PAUSED);
         validate_metadata(&metadata);
+        if let Some(schedule) = &milestone_schedule {
+            validate_milestone_schedule(schedule);
+        }
+        if let Some(schedule) = &rate_schedule {
+            validate_rate_schedule(schedule);
+        }
 
         // SEC-24: enforce per-employer, per-ledger stream creation rate limit.
         check_and_increment_create_rate(&env, &employer, 1);
@@ -494,6 +514,17 @@ impl StreamContract {
         }
         if let Some(m) = metadata {
             set_stream_metadata(&env, id, &m);
+        }
+        if immutable {
+            set_stream_immutable(&env, id, true);
+        }
+        if let Some(schedule) = milestone_schedule {
+            set_milestone_schedule(&env, id, &schedule);
+            events::milestone_schedule_set(&env, id, schedule.len());
+        }
+        if let Some(schedule) = rate_schedule {
+            set_rate_schedule(&env, id, &schedule);
+            events::rate_schedule_set(&env, id, schedule.len());
         }
         index_employer_stream(&env, &employer, id);
         index_employee_stream(&env, &employee, id);
@@ -1310,6 +1341,7 @@ impl StreamContract {
         pause_reason: Option<soroban_sdk::String>,
     ) {
         employer.require_auth();
+        assert_not_immutable(&env, stream_id);
         let mut stream = load_stream(&env, stream_id).expect(ERR_STREAM_NOT_FOUND);
         assert_eq!(stream.employer, employer, "{}", ERR_NOT_EMPLOYER);
         assert_eq!(
@@ -1350,6 +1382,7 @@ impl StreamContract {
 
         let now = env.ledger().timestamp();
         for stream_id in stream_ids.iter() {
+            assert_not_immutable(&env, stream_id);
             let mut stream = load_stream(&env, stream_id).expect(ERR_STREAM_NOT_FOUND);
             assert_eq!(stream.employer, employer, "{}", ERR_NOT_EMPLOYER);
             assert_eq!(
@@ -1505,10 +1538,41 @@ impl StreamContract {
         // at the new rate only.
         stream.last_withdraw_time = accrual_start(&env, stream.id, now);
 
-        let old_rate = stream.rate_per_second;
+        let old_rate = active_rate_at(&env, stream_id, &stream, now);
         stream.rate_per_second = new_rate;
         save_stream(&env, &stream);
         events::rate_updated(&env, stream_id, old_rate, new_rate);
+    }
+
+    /// Employer installs a forward schedule of automatic rate changes (SC-79).
+    ///
+    /// The schedule is a sorted `Vec<(timestamp, rate)>`; at each timestamp the
+    /// active rate advances automatically without further employer action.
+    /// Timestamps must be strictly increasing and in the future, and each rate
+    /// must be within the valid range. Replaces any existing schedule.
+    ///
+    /// # Parameters
+    /// - `employer` — must match the stream's employer (requires auth)
+    /// - `stream_id` — ID of the stream
+    /// - `schedule` — sorted `(timestamp, rate)` pairs
+    ///
+    /// # Errors
+    /// - E015 if the stream does not exist
+    /// - E018 if the caller is not the stream's employer
+    /// - E036 if the schedule is empty, unsorted, or contains an invalid rate
+    pub fn set_rate_schedule(
+        env: Env,
+        employer: Address,
+        stream_id: u64,
+        schedule: Vec<(u64, i128)>,
+    ) {
+        employer.require_auth();
+        let stream = load_stream(&env, stream_id).expect(ERR_STREAM_NOT_FOUND);
+        assert_eq!(stream.employer, employer, "{}", ERR_NOT_EMPLOYER);
+        assert_payroll_stream(&env, stream_id);
+        validate_rate_schedule(&schedule);
+        set_rate_schedule(&env, stream_id, &schedule);
+        events::rate_schedule_set(&env, stream_id, schedule.len());
     }
 
     /// Employer updates the hard stop time of an Active stream.
@@ -1550,6 +1614,53 @@ impl StreamContract {
         events::stop_time_updated(&env, stream_id, old_stop_time, new_stop_time);
     }
 
+    /// Employer updates the hard stop time of multiple Active streams atomically.
+    ///
+    /// Applies the same validation as [`update_stop_time`] to each entry. All
+    /// updates succeed or all revert; a single invalid entry reverts the whole
+    /// batch. Emits a `stop_time_updated` event per changed stream.
+    ///
+    /// # Parameters
+    /// - `employer` — must own every stream (requires auth once)
+    /// - `updates` — list of `(stream_id, new_stop_time)` pairs; 1–50 entries
+    ///
+    /// # Errors
+    /// - Panics if `updates` is empty or exceeds the configured batch size
+    /// - E015 if any stream does not exist
+    /// - E017 if any stream is not Active
+    /// - E018 if any stream is not owned by `employer`
+    /// - E030 if a nonzero `new_stop_time` precedes `last_withdraw_time`
+    pub fn update_stop_time_batch(env: Env, employer: Address, updates: Vec<(u64, u64)>) {
+        employer.require_auth();
+        assert!(!updates.is_empty(), "{}", ERR_EMPTY_PARAMS);
+        assert!(
+            updates.len() <= get_max_batch_size(&env),
+            "{}",
+            ERR_BATCH_TOO_LARGE
+        );
+
+        for (stream_id, new_stop_time) in updates.iter() {
+            let mut stream = load_stream(&env, stream_id).expect(ERR_STREAM_NOT_FOUND);
+            assert_eq!(stream.employer, employer, "{}", ERR_NOT_EMPLOYER);
+            assert_eq!(
+                stream.status,
+                StreamStatus::Active,
+                "{}",
+                ERR_STREAM_NOT_ACTIVE
+            );
+            assert!(
+                new_stop_time == 0 || new_stop_time >= stream.last_withdraw_time,
+                "{}",
+                ERR_INVALID_STOP_TIME
+            );
+
+            let old_stop_time = stream.stop_time;
+            stream.stop_time = new_stop_time;
+            save_stream(&env, &stream);
+            events::stop_time_updated(&env, stream_id, old_stop_time, new_stop_time);
+        }
+    }
+
     /// Employer cancels a stream and reclaims unstreamed funds.    ///
     /// The employee receives all tokens earned up to the cancellation time.
     /// The employer is refunded the remaining deposit. Works on both Active
@@ -1566,6 +1677,7 @@ impl StreamContract {
     /// - Panics if stream is already Cancelled or Exhausted
     pub fn cancel_stream(env: Env, employer: Address, stream_id: u64, cancel_reason: Option<Symbol>) {
         employer.require_auth();
+        assert_not_immutable(&env, stream_id);
         let mut stream = load_stream(&env, stream_id).expect(ERR_STREAM_NOT_FOUND);
         assert_eq!(stream.employer, employer, "{}", ERR_NOT_EMPLOYER);
         assert!(
@@ -1635,6 +1747,7 @@ impl StreamContract {
         let now = env.ledger().timestamp();
 
         for stream_id in stream_ids.iter() {
+            assert_not_immutable(&env, stream_id);
             let mut stream = load_stream(&env, stream_id).expect("stream not found");
             assert_eq!(stream.employer, employer, "not the employer");
             assert!(
@@ -2008,6 +2121,24 @@ impl StreamContract {
         get_linear_vest_schedule(&env, stream_id)
     }
 
+    /// Return the milestone vesting schedule, or `None` for non-milestone streams (SC-78).
+    pub fn get_milestone_schedule(env: Env, stream_id: u64) -> Option<Vec<(u64, u32)>> {
+        load_stream(&env, stream_id).expect(ERR_STREAM_NOT_FOUND);
+        get_milestone_schedule(&env, stream_id)
+    }
+
+    /// Return the forward rate schedule, or `None` if none is configured (SC-79).
+    pub fn get_rate_schedule(env: Env, stream_id: u64) -> Option<Vec<(u64, i128)>> {
+        load_stream(&env, stream_id).expect(ERR_STREAM_NOT_FOUND);
+        get_rate_schedule(&env, stream_id)
+    }
+
+    /// Return whether a stream is immutable (non-cancellable, non-pausable) (SC-77).
+    pub fn is_immutable(env: Env, stream_id: u64) -> bool {
+        load_stream(&env, stream_id).expect(ERR_STREAM_NOT_FOUND);
+        get_stream_immutable(&env, stream_id)
+    }
+
     /// Query how many tokens the employee can withdraw right now.
     ///
     /// Returns 0 for Cancelled or Exhausted streams.
@@ -2023,6 +2154,73 @@ impl StreamContract {
     pub fn claimable(env: Env, stream_id: u64) -> i128 {
         let stream = load_stream(&env, stream_id).expect(ERR_STREAM_NOT_FOUND);
         stream_claimable_amount(&env, &stream, env.ledger().timestamp())
+    }
+
+    /// Withdraw claimable tokens to an alternate recipient (SC-80).
+    ///
+    /// The receipt holder authorizes the withdrawal but tokens are transferred
+    /// to `to` (e.g. a savings wallet). The holder's claimable balance is
+    /// decremented exactly as in [`withdraw`].
+    ///
+    /// # Parameters
+    /// - `employee` — receipt holder (requires auth)
+    /// - `stream_id` — ID of the stream to withdraw from
+    /// - `to` — recipient of the withdrawn tokens
+    ///
+    /// # Returns
+    /// Amount transferred as `i128`; 0 if nothing was claimable.
+    ///
+    /// # Errors
+    /// - Panics if contract is paused
+    /// - E015 if the stream does not exist
+    /// - E016 if `employee` does not hold the receipt
+    /// - E037 if `to` is invalid
+    /// - E003 if a reentrant withdraw is detected
+    pub fn withdraw_to(env: Env, employee: Address, stream_id: u64, to: Address) -> i128 {
+        employee.require_auth();
+        assert!(!get_paused(&env), "{}", ERR_CONTRACT_PAUSED);
+        validate_withdraw_to(&employee, &to);
+        let mut stream = load_stream(&env, stream_id).expect(ERR_STREAM_NOT_FOUND);
+        assert_eq!(
+            receipt_owner(&env, &stream),
+            employee,
+            "{}",
+            ERR_NOT_EMPLOYEE
+        );
+        assert!(
+            stream.status == StreamStatus::Active || stream.status == StreamStatus::Exhausted,
+            "{}",
+            ERR_STREAM_NOT_ACTIVE
+        );
+
+        let now = env.ledger().timestamp();
+        if let Some(c) = mark_cliff_reached(&env, stream.id, now) {
+            events::cliff_reached(&env, stream.id, c);
+        }
+        let amount = stream_claimable_amount(&env, &stream, now);
+        if amount == 0 {
+            return 0;
+        }
+
+        assert!(!stream.locked, "{}", ERR_REENTRANT);
+        stream.locked = true;
+        save_stream(&env, &stream);
+
+        stream.withdrawn = stream.withdrawn.checked_add(amount).expect(ERR_OVERFLOW);
+        stream.last_withdraw_time = accrual_start(&env, stream.id, now);
+        stream.pending_accrual = 0;
+        if stream.withdrawn >= stream.deposit {
+            set_stream_ended_at(&env, stream_id, now);
+            stream.status = StreamStatus::Exhausted;
+        }
+
+        let token_client = token::Client::new(&env, &stream.token);
+        token_client.transfer(&env.current_contract_address(), &to, &amount);
+
+        stream.locked = false;
+        save_stream(&env, &stream);
+        events::withdraw_to(&env, stream_id, &employee, &to, amount);
+        amount
     }
 
     /// Proactively checks whether an Active stream is approaching or has passed
@@ -2103,6 +2301,13 @@ impl StreamContract {
     pub fn claimable_at(env: Env, stream_id: u64, timestamp: u64) -> i128 {
         let stream = load_stream(&env, stream_id).expect(ERR_STREAM_NOT_FOUND);
         stream_claimable_amount(&env, &stream, timestamp)
+    }
+
+    /// Return the rate that is active for a stream at the current ledger time,
+    /// accounting for any forward rate schedule (SC-79).
+    pub fn active_rate(env: Env, stream_id: u64) -> i128 {
+        let stream = load_stream(&env, stream_id).expect(ERR_STREAM_NOT_FOUND);
+        active_rate_at(&env, stream_id, &stream, env.ledger().timestamp())
     }
 
     /// Check if a stream's remaining deposit is below the low-balance threshold.
@@ -2256,6 +2461,9 @@ impl StreamContract {
             None,
             t.cliff_time,
             t.metadata,
+            false,
+            None,
+            None,
         )
     }
 
@@ -2406,6 +2614,22 @@ impl StreamContract {
         events::upgrade_cancelled(&env);
     }
 
+    /// Return the pending upgrade proposal, if one has been raised.
+    ///
+    /// Returns `Some((wasm_hash, unlock_time))` when a [`propose_upgrade`] call
+    /// is awaiting its timelock, or `None` when no upgrade is in flight.
+    /// Read-only; no authentication required.
+    ///
+    /// Use this during the upgrade runbook to verify the queued hash and
+    /// unlock time before calling [`execute_upgrade`].
+    ///
+    /// # Returns
+    /// `Some((BytesN<32>, u64))` — the queued WASM hash and the earliest
+    /// timestamp at which `execute_upgrade` will succeed, or `None`.
+    pub fn get_pending_upgrade(env: Env) -> Option<(soroban_sdk::BytesN<32>, u64)> {
+        get_pending_upgrade(&env).map(|p| (p.wasm_hash, p.unlock_time))
+    }
+
     /// No-op migration hook called by the admin after an upgrade.
     ///
     /// Confirms the new WASM is operational and the admin key is still valid.
@@ -2468,6 +2692,42 @@ impl StreamContract {
     /// `Some(Address)` of the pending admin, or `None`.
     pub fn get_pending_admin(env: Env) -> Option<Address> {
         storage::get_pending_admin(&env)
+    }
+
+    /// Return the current contract admin address.
+    ///
+    /// Read-only governance query for off-chain tooling. Equivalent to
+    /// [`admin`]; panics if the contract has not been initialised.
+    ///
+    /// # Returns
+    /// The admin [`Address`].
+    ///
+    /// # Errors
+    /// - Panics with "admin not set" (E021) if the contract has not been initialised.
+    pub fn get_admin(env: Env) -> Address {
+        get_admin(&env)
+    }
+
+    /// Return the minimum deposit enforced on `create_stream`.
+    ///
+    /// Read-only query so clients can validate a deposit before submitting a
+    /// transaction. Returns 0 if no minimum has been configured.
+    ///
+    /// # Returns
+    /// Minimum deposit as `i128`.
+    pub fn get_min_deposit(env: Env) -> i128 {
+        get_min_deposit(&env)
+    }
+
+    /// Return whether the contract is currently paused.
+    ///
+    /// Read-only query so clients can check pause state before submission.
+    /// Equivalent to [`is_paused`].
+    ///
+    /// # Returns
+    /// `true` if the contract is paused, `false` otherwise.
+    pub fn get_paused(env: Env) -> bool {
+        get_paused(&env)
     }
 
     /// Return the current admin nonce.
