@@ -14,64 +14,83 @@ services:
       - cargo-cache:/usr/local/cargo/registry
     command: cargo test
 
-  # Indexer service.
-  #
-  # Network selection is driven entirely by environment variables so the same
-  # compose file runs against testnet or mainnet without edits:
-  #   NETWORK              - network name (testnet | mainnet)
-  #   NETWORK_PASSPHRASE   - Stellar network passphrase (must match NETWORK)
-  #   RPC_URL              - Soroban RPC endpoint for the selected network
-  #   STREAM_CONTRACT_ID   - stream contract ID deployed on the selected network
-  #
-  # Ingest mode:
-  #   INGEST_MODE          - live | backfill | catchup
-  #     * live     - follow the chain from the current tip
-  #     * backfill - replay events from BACKFILL_START_LEDGER (or genesis)
-  #     * catchup  - resume from the persisted high-water mark in CURSOR_PATH
-  #
-  # NOTE: backfill and live modes are mutually exclusive. Run backfill (or
-  # catchup) to completion before switching INGEST_MODE to live; the indexer
-  # refuses to start if both are requested simultaneously.
+  backend-build:
+    build:
+      context: .
+      target: backend
+    image: ghcr.io/${GITHUB_REPOSITORY:-local}/stream-backend:${IMAGE_TAG:-latest}
+
+  backend-test:
+    build:
+      context: .
+      target: backend-test
+    volumes:
+      - .:/app
+      - cargo-cache:/usr/local/cargo/registry
+    command: cargo test --workspace --all-features
+    environment:
+      DATABASE_URL: postgres://stream:stream@postgres:5432/stream
+      STELLAR_RPC_URL: ${STELLAR_RPC_URL:-https://soroban-testnet.stellar.org}
+      STREAM_CONTRACT_ID: ${STREAM_CONTRACT_ID:-}
+      START_LEDGER: ${START_LEDGER:-0}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-stream}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-stream}
+      POSTGRES_DB: ${POSTGRES_DB:-stream}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-stream} -d ${POSTGRES_DB:-stream}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   indexer:
     build:
       context: .
-      target: runtime
-    image: ghcr.io/${GITHUB_REPOSITORY:-local}/stream-contract:${IMAGE_TAG:-latest}
+      target: backend
+    image: ghcr.io/${GITHUB_REPOSITORY:-local}/stream-backend:${IMAGE_TAG:-latest}
     command: ["indexer"]
     environment:
-      NETWORK: ${NETWORK:-testnet}
-      NETWORK_PASSPHRASE: ${NETWORK_PASSPHRASE:-Test SDF Network ; September 2015}
-      RPC_URL: ${RPC_URL:-https://soroban-testnet.stellar.org}
+      DATABASE_URL: ${DATABASE_URL:-postgres://stream:stream@postgres:5432/stream}
+      STELLAR_RPC_URL: ${STELLAR_RPC_URL:-https://soroban-testnet.stellar.org}
       STREAM_CONTRACT_ID: ${STREAM_CONTRACT_ID:-}
-      INGEST_MODE: ${INGEST_MODE:-live}
-      BACKFILL_START_LEDGER: ${BACKFILL_START_LEDGER:-0}
-      CURSOR_PATH: ${CURSOR_PATH:-/data/indexer-cursor.json}
-    volumes:
-      - indexer-data:/data
+      START_LEDGER: ${START_LEDGER:-0}
+      INDEXER_POLL_INTERVAL_MS: ${INDEXER_POLL_INTERVAL_MS:-5000}
+      RUST_LOG: ${RUST_LOG:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
 
-  # Optional dashboard/API service. Uses the same network configuration as the
-  # indexer so both components agree on passphrase, RPC and contract IDs.
-  dashboard:
+  webhook-relay:
     build:
       context: .
-      target: runtime
-    image: ghcr.io/${GITHUB_REPOSITORY:-local}/stream-contract:${IMAGE_TAG:-latest}
-    command: ["dashboard"]
+      target: backend
+    image: ghcr.io/${GITHUB_REPOSITORY:-local}/stream-backend:${IMAGE_TAG:-latest}
+    command: ["webhook-relay"]
     environment:
-      NETWORK: ${NETWORK:-testnet}
-      NETWORK_PASSPHRASE: ${NETWORK_PASSPHRASE:-Test SDF Network ; September 2015}
-      RPC_URL: ${RPC_URL:-https://soroban-testnet.stellar.org}
-      STREAM_CONTRACT_ID: ${STREAM_CONTRACT_ID:-}
-      CURSOR_PATH: ${CURSOR_PATH:-/data/indexer-cursor.json}
-    volumes:
-      - indexer-data:/data
-    ports:
-      - "${DASHBOARD_PORT:-3000}:3000"
+      DATABASE_URL: ${DATABASE_URL:-postgres://stream:stream@postgres:5432/stream}
+      WEBHOOK_SIGNING_SECRET: ${WEBHOOK_SIGNING_SECRET:-change-me-in-production}
+      WEBHOOK_MAX_ATTEMPTS: ${WEBHOOK_MAX_ATTEMPTS:-8}
+      WEBHOOK_BASE_BACKOFF_MS: ${WEBHOOK_BASE_BACKOFF_MS:-500}
+      WEBHOOK_RELAY_POLL_INTERVAL_MS: ${WEBHOOK_RELAY_POLL_INTERVAL_MS:-2000}
+      RUST_LOG: ${RUST_LOG:-info}
     depends_on:
-      - indexer
+      postgres:
+        condition: service_healthy
+      indexer:
+        condition: service_started
     restart: unless-stopped
 
 volumes:
   cargo-cache:
-  indexer-data:
+  postgres-data:

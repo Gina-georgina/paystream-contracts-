@@ -91,6 +91,28 @@ Applies only to streams created afterwards; existing streams are unaffected.
 
 Use admin batch expiry when streams have crossed `stop_time + GRACE_PERIOD` and the employee has already exhausted any remaining claimable balance. The admin nonce is consumed even if no streams are eligible.
 
+### 3.1 Keeper pre-check with `is_stream_expirable`
+
+Before building a batch, query `is_stream_expirable` for each candidate. It is read-only (no nonce, no auth) and returns a tuple of `(eligible: bool, seconds_until_eligible: u64)`. When `eligible` is `true`, `seconds_until_eligible` is `0`; otherwise it is the number of seconds remaining until the stream crosses `stop_time + GRACE_PERIOD`. This lets keepers skip streams that would be silently ignored and avoid wasted admin calls.
+
+```bash
+# Read-only: no nonce required
+stellar contract invoke --id "$STREAM_ID" --source "$ADMIN" --network "$NETWORK" \
+  -- is_stream_expirable --stream_id 1
+# => [true, 0]        stream is eligible now
+# => [false, 3600]    eligible in 3600 seconds
+```
+
+Keeper loop:
+
+1. For each tracked stream, call `is_stream_expirable`.
+2. Collect IDs where `eligible == true` into a batch.
+3. If the batch is empty, do nothing — no nonce is consumed.
+4. Otherwise re-read the nonce and run `expire_streams` (below).
+5. For ineligible streams, schedule the next check at `now + seconds_until_eligible`.
+
+### 3.2 Batch expiry
+
 ```bash
 # Re-read the nonce before the admin batch
 export NONCE=$(stellar contract invoke --id "$STREAM_ID" --source "$ADMIN" --network "$NETWORK" -- admin_nonce)
@@ -101,7 +123,32 @@ stellar contract invoke --id "$STREAM_ID" --source "$ADMIN" --network "$NETWORK"
 
 Eligible streams are transitioned to `Exhausted`; ineligible IDs are silently skipped. This keeps off-chain indexes accurate without reverting the whole batch.
 
+## 3b. Keeper: find and settle streams nearing expiry
+
+Keepers use the read-only `streams_expiring_before(timestamp)` query to discover streams whose `stop_time` is at or before the given timestamp. It reads from the `StreamsByTimestamp` index, does not mutate state, and returns a **bounded** result set — if more streams are eligible than the cap, only the first batch is returned, so re-run the query after processing to pick up the rest.
+
+```bash
+# Unix timestamp (seconds) — e.g. now + 1 hour to catch streams expiring soon
+export CUTOFF=$(($(date +%s) + 3600))
+
+stellar contract invoke --id "$STREAM_ID" --source "$KEEPER" --network "$NETWORK" \
+  -- streams_expiring_before --timestamp "$CUTOFF"
+```
+
+Feed the returned IDs into the appropriate call:
+
+```bash
+# Settle a single stream (permissionless once stop_time has passed)
+stellar contract invoke --id "$STREAM_ID" --source "$KEEPER" --network "$NETWORK" \
+  -- settle_stream --stream_id <STREAM_ID>
+
+# Or batch-expire streams past stop_time + GRACE_PERIOD (admin only — see section 3)
+stellar contract invoke --id "$STREAM_ID" --source "$ADMIN" --network "$NETWORK" \
+  -- expire_streams --admin "$ADMIN_ADDRESS" --nonce "$NONCE" --stream_ids '[<IDS>]'
+```
+
 ## 4. Admin transfer
+=======
 
 Two-step handover. The nonce passed to `propose_admin` must also be passed to `accept_admin`.
 
@@ -149,81 +196,83 @@ stellar contract invoke --id "$STREAM_ID" --source "$ADMIN" --network "$NETWORK"
 stellar contract invoke --id "$STREAM_ID" --source "$ADMIN" --network "$NETWORK" -- version
 ```
 
-## 6. Indexer ledger catch-up and historical backfill
+## 6. Indexer event ingestion (idempotency & replay protection)
 
-The indexer runs in exactly one ingestion mode at a time: **live**, **catch-up**, or **backfill**. Modes never overlap, so the same ledger range is never ingested twice.
+The indexer must never double-count events when a ledger is reprocessed or the process restarts. Ingestion is idempotent and resumable.
 
-### 6.1 Configuration
+### 6.1 Persistence schema
+
+```sql
+-- One row per on-chain event. The unique key makes ingestion idempotent.
+CREATE TABLE events (
+    id               BIGSERIAL PRIMARY KEY,
+    contract_id      TEXT    NOT NULL,
+    ledger_sequence  BIGINT  NOT NULL,
+    event_index      INTEGER NOT NULL,   -- position within the ledger
+    payload          JSONB   NOT NULL,
+    ingested_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (contract_id, ledger_sequence, event_index)
+);
+
+-- Monotonic high-water-mark, one row per contract.
+CREATE TABLE ingestion_state (
+    contract_id           TEXT   PRIMARY KEY,
+    last_processed_ledger BIGINT NOT NULL
+);
+```
+
+Writes use `INSERT ... ON CONFLICT DO NOTHING`, so replaying a ledger is a no-op for events already stored:
+
+```sql
+INSERT INTO events (contract_id, ledger_sequence, event_index, payload)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (contract_id, ledger_sequence, event_index) DO NOTHING;
+```
+
+### 6.2 High-water-mark semantics
+
+- `ingestion_state.last_processed_ledger` is the highest ledger that has been **fully** ingested for the contract.
+- It is advanced **monotonically only** — the update never moves it backwards:
+
+  ```sql
+  INSERT INTO ingestion_state (contract_id, last_processed_ledger)
+  VALUES ($1, $2)
+  ON CONFLICT (contract_id) DO UPDATE
+    SET last_processed_ledger = GREATEST(ingestion_state.last_processed_ledger, EXCLUDED.last_processed_ledger);
+  ```
+
+- The event insert and the high-water-mark update for a ledger run in the **same transaction**, so the mark never claims a ledger whose events were not persisted.
+
+### 6.3 Dedupe buffer (out-of-order delivery)
+
+Before any DB write, events pass through an in-memory buffer keyed by `contract_id:ledger_sequence:event_index` (bounded LRU set). This absorbs duplicate and out-of-order delivery within a batch window. The DB unique constraint remains the source of truth; the buffer is only a fast pre-filter and may be safely dropped on restart.
+
+### 6.4 Restart / resume behavior
+
+On startup the indexer reads the persisted high-water-mark:
+
+- If a row exists for the contract, ingestion resumes at `last_processed_ledger + 1`.
+- If no row exists (first run), ingestion starts at the configured start ledger.
+
+Because reprocessing is idempotent, resuming from `last_processed_ledger` (rather than `+ 1`) is also safe; the overlap is deduplicated by the unique constraint.
 
 ```bash
-export NETWORK=testnet                  # selects the network profile (see §7)
-export BACKFILL_START_LEDGER=0          # 0 = genesis; set to a ledger number to start later
+# Inspect progress
+psql "$DATABASE_URL" -c "SELECT * FROM ingestion_state;"
+
+# Verify no duplicates exist for a ledger
+psql "$DATABASE_URL" -c \
+  "SELECT ledger_sequence, event_index, count(*) FROM events
+   GROUP BY 1,2 HAVING count(*) > 1;"
 ```
 
-- `BACKFILL_START_LEDGER=0` replays from genesis.
-- Any other value replays from that ledger (inclusive).
-- The persisted high-water mark (last successfully ingested ledger) is stored by the indexer and survives restarts.
+### 6.5 Ingestion tests
 
-### 6.2 Backfill (from genesis or a configured start ledger)
+The indexer test suite covers:
 
-```bash
-paystream-indexer backfill --start-ledger "$BACKFILL_START_LEDGER"
-```
-
-Backfill ignores the high-water mark and replays the configured range. Use it for new deployments or after a long downtime where the cursor is missing or known to be behind.
-
-### 6.3 Catch-up (resume from high-water mark)
-
-```bash
-paystream-indexer catch-up
-```
-
-Catch-up resumes from the persisted high-water mark and replays forward until it reaches the current ledger, then hands off to live mode. If no cursor exists, it falls back to `BACKFILL_START_LEDGER`.
-
-### 6.4 Observing progress
-
-The indexer logs the current mode and cursor on every batch:
-
-```
-mode=catch-up cursor=1234567 target=1234999
-mode=catch-up cursor=1234999 target=1234999 complete
-```
-
-- `cursor` is the last successfully ingested ledger.
-- `target` is the current network ledger (or the backfill end).
-- `complete` is logged when the range is exhausted and the indexer switches to live mode.
-
-### 6.5 Resuming an interrupted run
-
-If the indexer stops mid-run, restart it with the same command. The cursor is only advanced **after** a batch is successfully ingested, so an interrupted run resumes from the last committed ledger with no gaps and no duplicates. Re-running `backfill` with the same `BACKFILL_START_LEDGER` is safe and idempotent.
-
-### 6.6 Mode exclusivity
-
-Only one ingestion mode runs at a time. Starting `backfill` or `catch-up` while live ingestion is active is refused; stop the live indexer first. This guarantees backfill and live ingestion never overlap or duplicate events.
-
-## 7. Switching networks
-
-The same stack runs against testnet or mainnet with no code changes. Select the network with `NETWORK`; the passphrase, RPC URL, and contract IDs are resolved per network:
-
-```bash
-export NETWORK=mainnet
-export NETWORK_PASSPHRASE="Public Global Stellar Network ; September 2015"
-export RPC_URL=https://mainnet.sorobanrpc.com
-export STREAM_CONTRACT_ID=<MAINNET_STREAM_CONTRACT_ID>
-```
-
-For testnet:
-
-```bash
-export NETWORK=testnet
-export NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
-export RPC_URL=https://soroban-testnet.stellar.org
-export STREAM_CONTRACT_ID=<TESTNET_STREAM_CONTRACT_ID>
-```
-
-- Both the indexer and the API **refuse to start** if `NETWORK_PASSPHRASE` does not match the selected `NETWORK` profile.
-- Contract IDs are validated against the selected network; an ID that does not exist on that network fails startup.
-- Switching networks requires a fresh indexer cursor for that network — run [backfill](#62-backfill-from-genesis-or-a-configured-start-ledger) on first use.
+- **Reprocess same ledger** — ingesting a ledger twice inserts each event once.
+- **Restart mid-stream** — a fresh process resumes from the persisted high-water-mark with no loss.
+- **Out-of-order delivery** — events delivered out of order are stored once and the high-water-mark advances monotonically.
 
 ## Common errors and recovery
 

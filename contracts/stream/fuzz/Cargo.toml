@@ -35,5 +35,13 @@ name = "fuzz_batch_cancel"
 path = "src/fuzz_batch_cancel.rs"
 
 [[bin]]
+name = "fuzz_transfer_withdraw_all"
+path = "src/fuzz_transfer_withdraw_all.rs"
+
+[[bin]]
 name = "prop_claimable_invariant"
 path = "src/prop_claimable_invariant.rs"
+
+[[bin]]
+name = "prop_linear_vest_pause_resume"
+path = "src/prop_linear_vest_pause_resume.rs"

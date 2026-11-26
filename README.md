@@ -225,3 +225,8 @@ To report a vulnerability, please **do not** open a public issue. Instead, email
 For encrypted reporting, use our PGP key (fingerprint published in [SECURITY.md](SECURITY.md)) or contact us via Signal at the number listed there.
 
 See [SECURITY.md](SECURITY.md) for the full disclosure policy and supported versions.
+
+## Handsoff notes
+
+<!-- handsoff-issue-428 -->
+- #428: SC-60: Add top_up_batch entrypoint
