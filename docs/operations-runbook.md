@@ -91,6 +91,28 @@ Applies only to streams created afterwards; existing streams are unaffected.
 
 Use admin batch expiry when streams have crossed `stop_time + GRACE_PERIOD` and the employee has already exhausted any remaining claimable balance. The admin nonce is consumed even if no streams are eligible.
 
+### 3.1 Keeper pre-check with `is_stream_expirable`
+
+Before building a batch, query `is_stream_expirable` for each candidate. It is read-only (no nonce, no auth) and returns a tuple of `(eligible: bool, seconds_until_eligible: u64)`. When `eligible` is `true`, `seconds_until_eligible` is `0`; otherwise it is the number of seconds remaining until the stream crosses `stop_time + GRACE_PERIOD`. This lets keepers skip streams that would be silently ignored and avoid wasted admin calls.
+
+```bash
+# Read-only: no nonce required
+stellar contract invoke --id "$STREAM_ID" --source "$ADMIN" --network "$NETWORK" \
+  -- is_stream_expirable --stream_id 1
+# => [true, 0]        stream is eligible now
+# => [false, 3600]    eligible in 3600 seconds
+```
+
+Keeper loop:
+
+1. For each tracked stream, call `is_stream_expirable`.
+2. Collect IDs where `eligible == true` into a batch.
+3. If the batch is empty, do nothing — no nonce is consumed.
+4. Otherwise re-read the nonce and run `expire_streams` (below).
+5. For ineligible streams, schedule the next check at `now + seconds_until_eligible`.
+
+### 3.2 Batch expiry
+
 ```bash
 # Re-read the nonce before the admin batch
 export NONCE=$(stellar contract invoke --id "$STREAM_ID" --source "$ADMIN" --network "$NETWORK" -- admin_nonce)
@@ -101,7 +123,32 @@ stellar contract invoke --id "$STREAM_ID" --source "$ADMIN" --network "$NETWORK"
 
 Eligible streams are transitioned to `Exhausted`; ineligible IDs are silently skipped. This keeps off-chain indexes accurate without reverting the whole batch.
 
+## 3b. Keeper: find and settle streams nearing expiry
+
+Keepers use the read-only `streams_expiring_before(timestamp)` query to discover streams whose `stop_time` is at or before the given timestamp. It reads from the `StreamsByTimestamp` index, does not mutate state, and returns a **bounded** result set — if more streams are eligible than the cap, only the first batch is returned, so re-run the query after processing to pick up the rest.
+
+```bash
+# Unix timestamp (seconds) — e.g. now + 1 hour to catch streams expiring soon
+export CUTOFF=$(($(date +%s) + 3600))
+
+stellar contract invoke --id "$STREAM_ID" --source "$KEEPER" --network "$NETWORK" \
+  -- streams_expiring_before --timestamp "$CUTOFF"
+```
+
+Feed the returned IDs into the appropriate call:
+
+```bash
+# Settle a single stream (permissionless once stop_time has passed)
+stellar contract invoke --id "$STREAM_ID" --source "$KEEPER" --network "$NETWORK" \
+  -- settle_stream --stream_id <STREAM_ID>
+
+# Or batch-expire streams past stop_time + GRACE_PERIOD (admin only — see section 3)
+stellar contract invoke --id "$STREAM_ID" --source "$ADMIN" --network "$NETWORK" \
+  -- expire_streams --admin "$ADMIN_ADDRESS" --nonce "$NONCE" --stream_ids '[<IDS>]'
+```
+
 ## 4. Admin transfer
+=======
 
 Two-step handover. The nonce passed to `propose_admin` must also be passed to `accept_admin`.
 
@@ -149,103 +196,83 @@ stellar contract invoke --id "$STREAM_ID" --source "$ADMIN" --network "$NETWORK"
 stellar contract invoke --id "$STREAM_ID" --source "$ADMIN" --network "$NETWORK" -- version
 ```
 
-## 6. Operations endpoints (health, readiness, metrics)
+## 6. Indexer event ingestion (idempotency & replay protection)
 
-The indexer/API service exposes three unauthenticated HTTP endpoints for monitoring. They are served by the same process as the API; no admin credentials are required.
+The indexer must never double-count events when a ledger is reprocessed or the process restarts. Ingestion is idempotent and resumable.
 
-| Endpoint | Purpose | Success | Failure |
-|---|---|---|---|
-| `GET /healthz` | Process liveness | `200` while the process is up | No response / connection refused |
-| `GET /readyz` | Readiness: DB connectivity **and** indexer lag | `200` when DB reachable and lag ≤ threshold | `503` with a JSON body naming the failing check |
-| `GET /metrics` | Prometheus exposition format | `200` | — |
-
-### 6.1 `/healthz` — liveness
-
-Reports only that the process is running and its event loop is responsive. It does **not** touch the database or chain, so a `200` here means "do not restart the pod", not "safe to send traffic".
-
-```bash
-curl -fsS http://<indexer-host>:<port>/healthz
-```
-
-Wire this to the orchestrator liveness probe (restart on repeated failure).
-
-### 6.2 `/readyz` — readiness
-
-Runs two checks and returns `503` if either fails:
-
-1. **DB connectivity** — a `SELECT 1` against the indexer database.
-2. **Indexer lag** — `latest_chain_ledger - last_indexed_ledger` must be ≤ `INDEXER_MAX_LAG_LEDGERS` (default `50`). Lag is computed from the ledger cursor persisted by the indexer.
-
-```bash
-curl -fsS http://<indexer-host>:<port>/readyz
-# 200 {"status":"ok","db":"ok","lag_ledgers":3}
-# 503 {"status":"degraded","db":"ok","lag_ledgers":412,"max_lag_ledgers":50}
-```
-
-Wire this to the readiness probe so traffic is drained while the indexer catches up. A `503` here is expected during backfills and after a chain restart — do not page on readiness alone; page on the lag alert below.
-
-### 6.3 `/metrics` — Prometheus
-
-Scrape `/metrics` from the OPS Prometheus instance. Exported metrics relevant to the indexer:
-
-| Metric | Type | Description |
-|---|---|---|
-| `paystream_indexer_chain_lag_ledgers` | gauge | Ledgers between the chain head and the last indexed ledger |
-| `paystream_indexer_events_total` | counter | Events processed, labelled by `contract` and `event_type` |
-| `paystream_indexer_event_errors_total` | counter | Events that failed to decode/apply, labelled by `reason` |
-| `paystream_indexer_event_processing_seconds` | histogram | Per-batch event processing latency |
-| `paystream_indexer_db_up` | gauge | `1` if the DB check passes, `0` otherwise |
-
-Event throughput is `rate(paystream_indexer_events_total[5m])`; error rate is `rate(paystream_indexer_event_errors_total[5m]) / rate(paystream_indexer_events_total[5m])`.
-
-### 6.4 Lag alert (wired to OPS monitoring)
-
-The lag alert is defined in the OPS Prometheus rules and routed to the OPS on-call channel. It fires when the indexer falls behind the chain head for a sustained period:
-
-```yaml
-groups:
-  - name: paystream-indexer
-    rules:
-      - alert: PayStreamIndexerLagging
-        expr: paystream_indexer_chain_lag_ledgers > 50
-        for: 5m
-        labels:
-          severity: warning
-          team: ops
-        annotations:
-          summary: "Indexer is {{ $value }} ledgers behind chain head"
-          runbook: "docs/operations-runbook.md#64-lag-alert-wired-to-ops-monitoring"
-      - alert: PayStreamIndexerDown
-        expr: up{job="paystream-indexer"} == 0
-        for: 2m
-        labels:
-          severity: critical
-          team: ops
-```
-
-**Wiring:** the rule file lives in the OPS monitoring repo and is deployed with the Prometheus config; `team: ops` routes to the OPS on-call rotation via Alertmanager. Keep the threshold in sync with `INDEXER_MAX_LAG_LEDGERS` — if you change one, change the other in the same PR.
-
-**Response:** on `PayStreamIndexerLagging`, check `/readyz` and the `paystream_indexer_event_errors_total` rate. A rising error rate usually means a contract event shape changed or a decode bug — see the error-rate panel before restarting. On `PayStreamIndexerDown`, check `/healthz` and the process logs.
-
-### 6.5 Alerting on unexpected admin actions
-
-Admin/governance activity (admin nonce changes, `propose_admin`/`accept_admin`, pause/unpause, `set_min_deposit`, `set_protocol_fee`, and upgrade propose/execute/cancel) is indexed into the `admin_audit` table. Each row records the admin address, action, nonce, ledger, and tx hash, so the full audit trail is queryable by admin address:
+### 6.1 Persistence schema
 
 ```sql
-SELECT ledger, action, nonce, tx_hash
-FROM admin_audit
-WHERE admin = '<ADMIN_ADDRESS>'
-ORDER BY ledger DESC;
+-- One row per on-chain event. The unique key makes ingestion idempotent.
+CREATE TABLE events (
+    id               BIGSERIAL PRIMARY KEY,
+    contract_id      TEXT    NOT NULL,
+    ledger_sequence  BIGINT  NOT NULL,
+    event_index      INTEGER NOT NULL,   -- position within the ledger
+    payload          JSONB   NOT NULL,
+    ingested_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (contract_id, ledger_sequence, event_index)
+);
+
+-- Monotonic high-water-mark, one row per contract.
+CREATE TABLE ingestion_state (
+    contract_id           TEXT   PRIMARY KEY,
+    last_processed_ledger BIGINT NOT NULL
+);
 ```
 
-Alert on admin actions that were not expected. The OPS monitoring job polls `admin_audit` for rows newer than the last check and raises an alert for any action outside an approved change window:
+Writes use `INSERT ... ON CONFLICT DO NOTHING`, so replaying a ledger is a no-op for events already stored:
 
-- Any `pause_contract` / `unpause_contract` outside a declared incident window
-- Any `propose_admin` / `accept_admin` not matching a scheduled handover
-- Any `propose_upgrade` / `execute_upgrade` without a matching approved release tag
-- Any `set_protocol_fee` / `set_min_deposit` change
+```sql
+INSERT INTO events (contract_id, ledger_sequence, event_index, payload)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (contract_id, ledger_sequence, event_index) DO NOTHING;
+```
 
-Route these to the security on-call channel with `severity: critical`. On alert, confirm the action against the change log and the tx hash in `admin_audit`; if unplanned, follow the incident procedure and, for a rogue admin transfer, re-propose the correct admin immediately (see [Admin transfer](#4-admin-transfer)).
+### 6.2 High-water-mark semantics
+
+- `ingestion_state.last_processed_ledger` is the highest ledger that has been **fully** ingested for the contract.
+- It is advanced **monotonically only** — the update never moves it backwards:
+
+  ```sql
+  INSERT INTO ingestion_state (contract_id, last_processed_ledger)
+  VALUES ($1, $2)
+  ON CONFLICT (contract_id) DO UPDATE
+    SET last_processed_ledger = GREATEST(ingestion_state.last_processed_ledger, EXCLUDED.last_processed_ledger);
+  ```
+
+- The event insert and the high-water-mark update for a ledger run in the **same transaction**, so the mark never claims a ledger whose events were not persisted.
+
+### 6.3 Dedupe buffer (out-of-order delivery)
+
+Before any DB write, events pass through an in-memory buffer keyed by `contract_id:ledger_sequence:event_index` (bounded LRU set). This absorbs duplicate and out-of-order delivery within a batch window. The DB unique constraint remains the source of truth; the buffer is only a fast pre-filter and may be safely dropped on restart.
+
+### 6.4 Restart / resume behavior
+
+On startup the indexer reads the persisted high-water-mark:
+
+- If a row exists for the contract, ingestion resumes at `last_processed_ledger + 1`.
+- If no row exists (first run), ingestion starts at the configured start ledger.
+
+Because reprocessing is idempotent, resuming from `last_processed_ledger` (rather than `+ 1`) is also safe; the overlap is deduplicated by the unique constraint.
+
+```bash
+# Inspect progress
+psql "$DATABASE_URL" -c "SELECT * FROM ingestion_state;"
+
+# Verify no duplicates exist for a ledger
+psql "$DATABASE_URL" -c \
+  "SELECT ledger_sequence, event_index, count(*) FROM events
+   GROUP BY 1,2 HAVING count(*) > 1;"
+```
+
+### 6.5 Ingestion tests
+
+The indexer test suite covers:
+
+- **Reprocess same ledger** — ingesting a ledger twice inserts each event once.
+- **Restart mid-stream** — a fresh process resumes from the persisted high-water-mark with no loss.
+- **Out-of-order delivery** — events delivered out of order are stored once and the high-water-mark advances monotonically.
 
 ## Common errors and recovery
 

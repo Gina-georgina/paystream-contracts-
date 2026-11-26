@@ -54,6 +54,12 @@ Every `DataKey` variant in `contracts/stream/src/types.rs`, in declaration order
 | `CreateCountThisLedger(Address)` | `u32` | Temporary | 2 ledgers | `check_and_increment_create_rate` | Rate limiter |
 | `LastCreateLedger(Address)` | `u32` | Temporary | 2 ledgers | `check_and_increment_create_rate` | Rate limiter |
 | `SplitBeneficiaries(u64)` | `Vec<SplitBeneficiary>` | Persistent | Extended on read/write (1y → 2y) | Split stream creation (PROD-22) | Split withdrawals |
+| `StreamCold(u64)` | `StreamColdData` | Persistent | Extended on read/write (1y → 2y) | `create_stream` (when cold fields set), `set_low_balance_threshold`, `pause_stream` (SC-107) | `get_stream`, `claimable`, low-balance checks, pause-reason reads |
+| `StreamMetadata(u64)` | `Map<Symbol, String>` | Persistent | Extended on read/write (1y → 2y) | `create_stream` / `update_stream_metadata` (bounded, cap enforced) | `get_stream_metadata` |
+| `MaxBatchSize` | `u32` | Instance | Instance | `set_max_batch_size` (bounds `1..=200`) | All batch entry points (absent = 50) |
+| `StreamImmutable(u64)` | `bool` | Persistent | Extended on read/write (1y → 2y) | `create_stream` with `immutable = true` (SC-77) | `cancel_stream`, `pause_stream` (reject when `true`); `is_stream_immutable` (absent = `false`) |
+| `MilestoneSchedule(u64)` | `Vec<(u64, u32)>` | Persistent | Extended on read/write (1y → 2y) | Milestone stream creation (SC-78) | `claimable`, `withdraw`, `get_milestone_schedule` |
+| `RateSchedule(u64)` | `Vec<(u64, i128)>` | Persistent | Extended on read/write (1y → 2y) | `create_stream` / `update_rate_schedule` (sorted, gaps/overlaps validated) (SC-79) | `claimable`, `withdraw`, `get_rate_schedule` |
 
 > **Keep this table current.** Any PR that adds, removes, or changes a `DataKey` variant must update this table in the same PR (reviewers: check this).
 
@@ -70,12 +76,47 @@ Every `DataKey` variant in `contracts/stream/src/types.rs`, in declaration order
 | `id` | `u64` | Stream ID |
 | `last_withdraw_time` | `u64` | Ledger timestamp of the last withdrawal |
 | `locked` | `bool` | Reentrancy guard (normally `false` between transactions) |
+| `metadata` | `Map<Symbol, String>` | Optional bounded metadata map (e.g. department, cost center); empty when unset |
 | `rate_per_second` | `i128` | Tokens streamed per second |
 | `start_time` | `u64` | Ledger timestamp the stream started |
 | `status` | `StreamStatus` | `Vec[Symbol("Active" \| "Paused" \| "Cancelled" \| "Exhausted")]` |
 | `stop_time` | `u64` | Hard stop timestamp (`0` = no end) |
 | `token` | `Address` | Token contract address |
 | `withdrawn` | `i128` | Total already withdrawn |
+
+### `StreamColdData` value
+
+`StreamColdData` is a `#[contracttype]` struct stored under `StreamCold(u64)`, encoded as an
+`ScVal::Map` keyed by field name (`Symbol`), sorted alphabetically:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `low_balance_threshold` | `i128` | Threshold below which the stream is considered low-balance (`0` = disabled) |
+| `pause_reason` | `Symbol` | Reason recorded when the stream was paused |
+
+These fields are **cold**: they are rarely read or written, so SC-107 relocated them out of
+the hot `Stream` entry into a separate persistent entry. Streams that never set a
+low-balance threshold and were never paused have no `StreamCold` entry at all (absent =
+`low_balance_threshold` `0`, no `pause_reason`). Indexers should treat `StreamCold` as
+optional and fall back to those defaults.
+
+Legacy `Stream` values written before SC-107 may still carry `low_balance_threshold` and
+`pause_reason` inline. Per ADR-004, decoding remains backward compatible: readers accept
+both layouts, and a legacy stream is migrated to the split layout on its next write.
+
+#### Measured rent savings (SC-107)
+
+Per-stream rent was measured with the snapshot test
+`contracts/stream/src/test.rs::sc107_stream_rent_savings` (Soroban rent model, 1-year
+persistent TTL):
+
+| Layout | Rent per stream | Notes |
+|---|---|---|
+| Before (all fields in `Stream`) | _TBD_ | Baseline |
+| After (cold fields in `StreamCold`) | _TBD_ | Savings: _TBD_ |
+
+Savings come from the smaller hot `Stream` entry; streams without cold data pay no
+`StreamCold` rent at all.
 
 ---
 
@@ -105,77 +146,6 @@ Instance keys share the TTL of the contract instance entry.
 - `Version` — written by `migrate` after an upgrade; indexers can use it to detect schema changes.
 - `AdminNonce` — incremented by every admin call, including upgrades.
 - `PendingUpgrade` — set by `propose_upgrade`, cleared by `execute_upgrade` / `cancel_upgrade`.
-- `Stream`, `EmployerStreams`, `EmployeeStreams` — unchanged by upgrades. If a future version
-  changes the `Stream` struct layout, `Version` will be bumped and the change noted in
-  `CHANGELOG.md` and [upgrade-guide.md](upgrade-guide.md).
-
----
-
-## Off-chain indexer schema
-
-The indexer keeps its own persistent store (SQLite/Postgres) built from contract events and
-ledger state. It is versioned independently of the contract `Version` key so the indexer can
-evolve without a resync. Migrations live in `indexer/migrations/` as numbered, forward-only
-SQL files (`0001_init.sql`, `0002_admin_audit.sql`, …).
-
-### `schema_version`
-
-Single-row table tracking the applied migration.
-
-| Column | Type | Notes |
-|---|---|---|
-| `version` | `INTEGER` | Highest applied migration number |
-| `applied_at` | `TIMESTAMP` | When the migration ran |
-
-On startup the indexer reads `version`, applies every migration with a higher number in
-ascending order inside a transaction, and bumps `version`. Migrations are **forward-only**:
-there are no down migrations; a bad migration is fixed by adding a new numbered one. A
-migration that has already been applied is never edited.
-
-### Tables
-
-| Table | Purpose | Key columns |
-|---|---|---|
-| `streams` | One row per stream, mirroring the `Stream` struct | `id` (PK), `employer`, `employee`, `token`, `deposit`, `withdrawn`, `rate_per_second`, `start_time`, `stop_time`, `last_withdraw_time`, `status`, `stream_type`, `cliff_time`, `ended_at`, `created_ledger`, `updated_ledger` |
-| `beneficiaries` | Split beneficiaries per stream | `stream_id` (FK → `streams.id`), `address`, `bps`; PK `(stream_id, address)` |
-| `events` | Raw decoded contract events, append-only | `id` (PK), `contract_id`, `ledger`, `tx_hash`, `event_index`, `topic`, `stream_id`, `actor`, `amount`, `payload` (JSON), `ingested_at`; unique `(tx_hash, event_index)` |
-| `aggregates` | Precomputed rollups for dashboards | `bucket` (e.g. `day`), `bucket_start`, `employer`, `employee`, `token`, `stream_count`, `deposited`, `withdrawn`, `fees`; PK `(bucket, bucket_start, employer, employee, token)` |
-| `admin_audit` | Governance/admin actions (BE-11) | `id` (PK), `ledger`, `tx_hash`, `event_index`, `action`, `admin`, `target`, `nonce`, `payload` (JSON), `ingested_at`; unique `(tx_hash, event_index)` |
-
-`events` and `admin_audit` are append-only; reorg handling deletes rows above the fork ledger
-and re-ingests. `streams` and `aggregates` are derived and can be rebuilt from `events`.
-
-### Indexes (FE query patterns)
-
-| Index | Backs |
-|---|---|
-| `idx_streams_employer (employer, status)` | Employer dashboard: streams by employer, filtered by status |
-| `idx_streams_employee (employee, status)` | Employee dashboard: streams by employee, filtered by status |
-| `idx_streams_token (token, status)` | Token-filtered queries |
-| `idx_streams_status (status)` | Global status filters / counts |
-| `idx_streams_employer_created (employer, created_ledger)` | Time-ordered employer lists |
-| `idx_events_stream (stream_id, ledger)` | Per-stream event history |
-| `idx_events_topic (topic, ledger)` | Event-type scans |
-| `idx_aggregates_lookup (bucket, bucket_start, employer, employee, token)` | Aggregate lookups |
-| `idx_admin_audit_admin (admin, ledger)` | Audit trail by admin address (BE-11) |
-| `idx_admin_audit_action (action, ledger)` | Audit trail by action type |
-
-### Admin / governance events (BE-11)
-
-The following events are decoded into `admin_audit` with `action` set to the event name:
-
-- `propose_admin`, `accept_admin` (`target` = new admin)
-- `pause_contract`, `unpause_contract`
-- `set_min_deposit`, `set_protocol_fee` (`payload` holds old/new values)
-- `propose_upgrade`, `execute_upgrade`, `cancel_upgrade` (`payload` holds WASM hash / target)
-
-**Admin nonce sequence.** The contract stores `AdminNonce` as a counter, but the indexer
-reconstructs the sequence from events: each nonce-protected admin event carries its nonce in
-`payload`, and `admin_audit.nonce` stores it. The current nonce for an admin is
-`MAX(nonce)` over `admin_audit` for that `admin`; gaps or out-of-order nonces indicate a
-missed or replayed event and are flagged.
-
-**Alerts.** The indexer raises an alert when an admin action is unexpected: an `accept_admin`
-or `execute_upgrade` with no matching prior `propose_*`, a nonce gap, or a pause/unpause or
-fee change outside the configured expected window. Alerts are written to the `events` table
-with `topic = "alert"` and surfaced to governance tooling.
+- `Stream`, `StreamCold`, `EmployerStreams`, `EmployeeStreams` — unchanged by upgrades. If a
+  future version changes the `Stream` or `StreamCold` struct layout, `Version` will be bumped
+  and the change noted in `CHANGELOG.md` and [upgrade-guide.md](upgrade-guide.md).
