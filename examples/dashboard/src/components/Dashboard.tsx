@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { useLocale, useTranslations } from "next-intl";
 import {
   burnRate,
   ensureConnected,
@@ -15,10 +16,13 @@ import {
   withdrawAll,
   type StreamRow,
 } from "@/lib/stellar";
+import { formatAmount, formatRate } from "@/lib/format";
 
 type Tab = "employer" | "employee";
 
 export default function Dashboard() {
+  const t = useTranslations("Dashboard");
+  const locale = useLocale();
   const [address, setAddress] = useState("");
   const [tab, setTab] = useState<Tab>("employer");
   const [employerStreams, setEmployerStreams] = useState<StreamRow[]>([]);
@@ -155,19 +159,21 @@ export default function Dashboard() {
     <main>
       <header>
         <div>
-          <h1>PayStream Dashboard</h1>
+          <h1>{t("title")}</h1>
           <div className="muted">
-            contract <code>{STREAM_CONTRACT_ID ? shortAddr(STREAM_CONTRACT_ID) : "unset"}</code> · Stellar testnet
+            {t("contractLabel")}{" "}
+            <code>{STREAM_CONTRACT_ID ? shortAddr(STREAM_CONTRACT_ID) : t("contractUnset")}</code>{" "}
+            · {t("network")}
           </div>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
           {address && (
             <button className="secondary" onClick={() => refresh(address)} disabled={loading}>
-              {loading ? "Refreshing…" : "Refresh"}
+              {loading ? t("refreshing") : t("refresh")}
             </button>
           )}
           <button onClick={connect} disabled={loading}>
-            {address ? shortAddr(address) : "Connect Freighter"}
+            {address ? shortAddr(address) : t("connect")}
           </button>
         </div>
       </header>
@@ -210,48 +216,51 @@ export default function Dashboard() {
       )}
 
       {!address ? (
-        <div className="notice">
-          Connect your Freighter wallet to view streams. The dashboard reads streams where the
-          connected account is employer or employee on the configured testnet contract.
-        </div>
+        <div className="notice">{t("connectNotice")}</div>
       ) : (
         <>
           <div className="tabs">
             <button className={tab === "employer" ? "active" : ""} onClick={() => setTab("employer")}>
-              Employer ({employerStreams.length})
+              {t("tabs.employer", { count: employerStreams.length })}
             </button>
             <button className={tab === "employee" ? "active" : ""} onClick={() => setTab("employee")}>
-              Employee ({employeeStreams.length})
+              {t("tabs.employee", { count: employeeStreams.length })}
             </button>
           </div>
 
           {tab === "employer" ? (
             <div className="cards">
-              <Stat label="Streams" value={String(employerStreams.length)} />
-              <Stat label="Burn rate" value={`${formatAmount(burnRate(employerStreams))}/s`} />
-              <Stat label="Total claimable" value={formatAmount(totalClaimable)} />
+              <Stat label={t("stats.streams")} value={String(employerStreams.length)} />
               <Stat
-                label="Total remaining"
-                value={formatAmount(employerStreams.reduce((s, x) => s + x.remaining, 0n))}
+                label={t("stats.burnRate")}
+                value={formatRate(burnRate(employerStreams), locale)}
+              />
+              <Stat label={t("stats.totalClaimable")} value={formatAmount(totalClaimable, locale)} />
+              <Stat
+                label={t("stats.totalRemaining")}
+                value={formatAmount(
+                  employerStreams.reduce((s, x) => s + x.remaining, 0n),
+                  locale,
+                )}
               />
             </div>
           ) : (
             <div className="cards">
-              <Stat label="Streams" value={String(employeeStreams.length)} />
-              <Stat label="Claimable now" value={formatAmount(totalClaimable)} />
+              <Stat label={t("stats.streams")} value={String(employeeStreams.length)} />
+              <Stat label={t("stats.claimableNow")} value={formatAmount(totalClaimable, locale)} />
             </div>
           )}
 
           {tab === "employee" && totalClaimable > 0n && (
             <p>
               <button onClick={doWithdrawAll} disabled={busyId !== null}>
-                {busyId === "all" ? "Withdrawing…" : "Withdraw all"}
+                {busyId === "all" ? t("withdrawing") : t("withdrawAll")}
               </button>
             </p>
           )}
 
           {streams.length === 0 ? (
-            <div className="notice">No {tab} streams for this account.</div>
+            <div className="notice">{t("empty", { tab: t(`tabNames.${tab}`) })}</div>
           ) : (
             <StreamTable
               tab={tab}
@@ -286,15 +295,17 @@ function StreamTable({
   busyId: string | null;
   onWithdraw: (id: bigint) => void;
 }) {
+  const t = useTranslations("Dashboard");
+  const locale = useLocale();
   return (
     <table>
       <thead>
         <tr>
-          <th>ID</th>
-          <th>{tab === "employer" ? "Employee" : "Employer"}</th>
-          <th>Status</th>
-          <th>Claimable</th>
-          <th>Burn rate</th>
+          <th>{t("table.id")}</th>
+          <th>{tab === "employer" ? t("table.employee") : t("table.employer")}</th>
+          <th>{t("table.status")}</th>
+          <th>{t("table.claimable")}</th>
+          <th>{t("table.burnRate")}</th>
           {tab === "employee" && <th />}
         </tr>
       </thead>
@@ -306,17 +317,25 @@ function StreamTable({
               <code>{shortAddr(tab === "employer" ? s.employee : s.employer)}</code>
             </td>
             <td>
-              <span className={`pill ${s.status_label}`}>{s.status_label}</span>
+              <span className={`pill ${s.status_label}`}>
+                {t.has(`status.${s.status_label}`)
+                  ? t(`status.${s.status_label}`)
+                  : s.status_label}
+              </span>
             </td>
-            <td>{formatAmount(s.claimable)}</td>
-            <td>{s.status_label === "Active" ? `${formatAmount(s.rate_per_second)}/s` : "—"}</td>
+            <td>{formatAmount(s.claimable, locale)}</td>
+            <td>
+              {s.status_label === "Active"
+                ? formatRate(s.rate_per_second, locale)
+                : t("table.dash")}
+            </td>
             {tab === "employee" && (
               <td style={{ textAlign: "right" }}>
                 <button
                   onClick={() => onWithdraw(s.id)}
                   disabled={s.status_label !== "Active" || s.claimable <= 0n || busyId !== null}
                 >
-                  {busyId === s.id.toString() ? "…" : "Withdraw"}
+                  {busyId === s.id.toString() ? t("table.busy") : t("table.withdraw")}
                 </button>
               </td>
             )}
