@@ -1165,9 +1165,50 @@ stellar contract invoke --id <STREAM_ID> --source <EMPLOYER_KEY> --network testn
 
 ---
 
+### `update_stop_time_batch`
+
+Employer changes the hard stop timestamp of multiple Active streams atomically
+(SC-63). Each entry is validated exactly as in `update_stop_time`; if any entry
+fails validation the whole batch reverts and no stop time is changed. A
+`stop_time_updated` event is emitted for every entry on success.
+
+**Caller:** Employer
+
+| Parameter | Type | Description |
+|---|---|---|
+| `employer` | `Address` | Must own every stream (requires auth once) |
+| `updates` | `Vec<(u64, u64)>` | `(stream_id, new_stop_time)` pairs; 1 to 50 entries |
+
+**Returns:** nothing
+
+**Errors:**
+- Panics if `updates` is empty or contains more than 50 entries
+- Panics if any stream is not found
+- E017 if any stream is not Active
+- E018 if any stream does not belong to `employer`
+- E030 if any nonzero `new_stop_time` is before that stream's `last_withdraw_time`
+
+**Emitted event:** one `stop_time_updated(stream_id, old_stop_time, new_stop_time)` per entry
+
+**Example:**
+```bash
+stellar contract invoke --id <STREAM_ID> --source <EMPLOYER_KEY> --network testnet \
+  -- update_stop_time_batch --employer <EMPLOYER_ADDRESS> \
+  --updates '[[1,1893456000],[2,1893542400]]'
+```
+
+---
+
 ### `cancel_stream`
 
 Employer cancels a stream. The employee receives all earned tokens; the employer is refunded the remainder.
+
+The protocol fee charged at creation is refunded proportionally on the
+unstreamed portion of the deposit (SC-68): the employer receives back their
+share of the fee for the deposit that was never streamed, in addition to the
+net remaining deposit. The fee on the already-streamed portion is retained by
+the treasury. Accounting tracks the fee already refunded per stream so the fee
+is never refunded twice.
 
 **Caller:** Employer
 
@@ -1184,7 +1225,7 @@ Employer cancels a stream. The employee receives all earned tokens; the employer
 - Panics if stream is already Cancelled or Exhausted
 - E036 if the stream is immutable (SC-77)
 
-**Emitted event:** `stream_cancelled` (enriched — see [Events](#events) section)
+**Emitted event:** `stream_cancelled` (enriched, including the `fee_refund` amount — see [Events](#events) section)
 
 **Example:**
 ```bash
@@ -1659,6 +1700,79 @@ Off-chain tools use this to discover the admin without decoding raw ledger state
 ```bash
 stellar contract invoke --id <STREAM_ID> --source <ANY_KEY> --network testnet \
   -- admin
+```
+
+---
+
+### `get_admin`
+
+Read-only alias of `admin` (SC-71). Returns the current contract admin address
+for governance tooling.
+
+**Caller:** Anyone
+
+**Returns:** `Address`
+
+**Errors:**
+- Panics with "admin not set" (E021) if the contract has not been initialised.
+
+**Example:**
+```bash
+stellar contract invoke --id <STREAM_ID> --source <ANY_KEY> --network testnet \
+  -- get_admin
+```
+
+---
+
+### `get_pending_admin`
+
+Return the address nominated by `propose_admin` that has not yet accepted the
+admin role (SC-71). Governance tooling uses this to display and monitor
+in-flight admin transfers.
+
+**Caller:** Anyone
+
+**Returns:** `Option<Address>` — the pending admin, or `None` if no transfer is in progress
+
+**Example:**
+```bash
+stellar contract invoke --id <STREAM_ID> --source <ANY_KEY> --network testnet \
+  -- get_pending_admin
+```
+
+---
+
+### `get_min_deposit`
+
+Return the minimum deposit enforced on `create_stream` (SC-70). Clients can
+validate a deposit before submitting a transaction.
+
+**Caller:** Anyone
+
+**Returns:** `i128` — current minimum deposit (default `10_000` until changed via `set_min_deposit`)
+
+**Example:**
+```bash
+stellar contract invoke --id <STREAM_ID> --source <ANY_KEY> --network testnet \
+  -- get_min_deposit
+```
+
+---
+
+### `get_paused`
+
+Return whether the contract is currently paused (SC-70). While paused,
+`create_stream`, `create_streams_batch`, and `withdraw` are blocked. Clients can
+check this before submitting a transaction.
+
+**Caller:** Anyone
+
+**Returns:** `bool` — `true` if paused, `false` otherwise
+
+**Example:**
+```bash
+stellar contract invoke --id <STREAM_ID> --source <ANY_KEY> --network testnet \
+  -- get_paused
 ```
 
 ---
@@ -2181,10 +2295,11 @@ Emitted by `cancel_stream` instead of the generic status event. Carries the exac
 | `employer` | `Address` | Employer address (refund recipient) |
 | `employee` | `Address` | Employee address (claimable recipient) |
 | `claimable_paid` | `i128` | Tokens transferred to the employee at cancellation |
-| `refund_paid` | `i128` | Tokens returned to the employer |
+| `refund_paid` | `i128` | Tokens returned to the employer (net remaining deposit plus proportional fee refund) |
+| `fee_refund` | `i128` | Portion of the protocol fee refunded to the employer for the unstreamed deposit (SC-68) |
 
 **Topics:** `("cancelled", stream_id)`
-**Data:** `(employer, employee, claimable_paid, refund_paid)`
+**Data:** `(employer, employee, claimable_paid, refund_paid, fee_refund)`
 
 ---
 

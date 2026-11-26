@@ -1607,6 +1607,53 @@ impl StreamContract {
         events::stop_time_updated(&env, stream_id, old_stop_time, new_stop_time);
     }
 
+    /// Employer updates the hard stop time of multiple Active streams atomically.
+    ///
+    /// Applies the same validation as [`update_stop_time`] to each entry. All
+    /// updates succeed or all revert; a single invalid entry reverts the whole
+    /// batch. Emits a `stop_time_updated` event per changed stream.
+    ///
+    /// # Parameters
+    /// - `employer` — must own every stream (requires auth once)
+    /// - `updates` — list of `(stream_id, new_stop_time)` pairs; 1–50 entries
+    ///
+    /// # Errors
+    /// - Panics if `updates` is empty or exceeds the configured batch size
+    /// - E015 if any stream does not exist
+    /// - E017 if any stream is not Active
+    /// - E018 if any stream is not owned by `employer`
+    /// - E030 if a nonzero `new_stop_time` precedes `last_withdraw_time`
+    pub fn update_stop_time_batch(env: Env, employer: Address, updates: Vec<(u64, u64)>) {
+        employer.require_auth();
+        assert!(!updates.is_empty(), "{}", ERR_EMPTY_PARAMS);
+        assert!(
+            updates.len() <= get_max_batch_size(&env),
+            "{}",
+            ERR_BATCH_TOO_LARGE
+        );
+
+        for (stream_id, new_stop_time) in updates.iter() {
+            let mut stream = load_stream(&env, stream_id).expect(ERR_STREAM_NOT_FOUND);
+            assert_eq!(stream.employer, employer, "{}", ERR_NOT_EMPLOYER);
+            assert_eq!(
+                stream.status,
+                StreamStatus::Active,
+                "{}",
+                ERR_STREAM_NOT_ACTIVE
+            );
+            assert!(
+                new_stop_time == 0 || new_stop_time >= stream.last_withdraw_time,
+                "{}",
+                ERR_INVALID_STOP_TIME
+            );
+
+            let old_stop_time = stream.stop_time;
+            stream.stop_time = new_stop_time;
+            save_stream(&env, &stream);
+            events::stop_time_updated(&env, stream_id, old_stop_time, new_stop_time);
+        }
+    }
+
     /// Employer cancels a stream and reclaims unstreamed funds.    ///
     /// The employee receives all tokens earned up to the cancellation time.
     /// The employer is refunded the remaining deposit. Works on both Active
@@ -2638,6 +2685,42 @@ impl StreamContract {
     /// `Some(Address)` of the pending admin, or `None`.
     pub fn get_pending_admin(env: Env) -> Option<Address> {
         storage::get_pending_admin(&env)
+    }
+
+    /// Return the current contract admin address.
+    ///
+    /// Read-only governance query for off-chain tooling. Equivalent to
+    /// [`admin`]; panics if the contract has not been initialised.
+    ///
+    /// # Returns
+    /// The admin [`Address`].
+    ///
+    /// # Errors
+    /// - Panics with "admin not set" (E021) if the contract has not been initialised.
+    pub fn get_admin(env: Env) -> Address {
+        get_admin(&env)
+    }
+
+    /// Return the minimum deposit enforced on `create_stream`.
+    ///
+    /// Read-only query so clients can validate a deposit before submitting a
+    /// transaction. Returns 0 if no minimum has been configured.
+    ///
+    /// # Returns
+    /// Minimum deposit as `i128`.
+    pub fn get_min_deposit(env: Env) -> i128 {
+        get_min_deposit(&env)
+    }
+
+    /// Return whether the contract is currently paused.
+    ///
+    /// Read-only query so clients can check pause state before submission.
+    /// Equivalent to [`is_paused`].
+    ///
+    /// # Returns
+    /// `true` if the contract is paused, `false` otherwise.
+    pub fn get_paused(env: Env) -> bool {
+        get_paused(&env)
     }
 
     /// Return the current admin nonce.

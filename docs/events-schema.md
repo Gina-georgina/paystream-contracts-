@@ -282,12 +282,14 @@ Emitted when a stream is cancelled, recording the exact cash-flow split.
 **Data**:
 - `claimable_amount` (i128): Tokens paid to the employee at cancellation time
 - `refund_amount` (i128): Tokens returned to the employer (unstreamed portion)
+- `fee_refund` (i128): Protocol fee refunded to the employer, proportional to the
+  unstreamed deposit (SC-68). `0` when no fee was charged or nothing was unstreamed.
 
 **Example**:
 ```json
 {
   "topic": ["v1", "cancelled", 1],
-  "data": [300000, 700000]
+  "data": [300000, 700000, 3500]
 }
 ```
 
@@ -386,6 +388,28 @@ Emitted when a stream's rate_per_second is changed.
 {
   "topic": ["v1", "rate_upd", 1],
   "data": [1000000, 2000000]
+}
+```
+
+---
+
+### stop_time_updated
+
+Emitted when a stream's stop time is changed via `update_stop_time` or
+`update_stop_time_batch` (SC-63). The batch entrypoint emits one event per
+stream in the batch; the batch is all-or-nothing, so either every stream in
+the batch emits this event or none do.
+
+**Topic**: `["v1", "stop_upd", <stream_id>]`
+
+**Data**:
+- `stop_time` (u64): The new stop time (0 clears the stop time)
+
+**Example**:
+```json
+{
+  "topic": ["v1", "stop_upd", 1],
+  "data": [1767225600]
 }
 ```
 
