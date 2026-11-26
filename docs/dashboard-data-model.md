@@ -155,12 +155,20 @@ Admins can restrict which SEP-41 token addresses may be used as the stream token
 
 ---
 
-## 5. Suggested Indexer Schema
+## 5. Indexer Schema
+
+The indexer persists the data above in a relational store. The schema is defined in the backend crate (`backend/src/db/schema.rs`) and applied through **forward-only, versioned migrations** tracked in the `schema_version` table, so the indexer can evolve without a full resync.
+
+### 5.1 Tables
 
 ```text
+schema_version(version PK, applied_at)
+
 streams(id PK, employer, employee, token, deposit, withdrawn, rate_per_second,
         start_time, stop_time, status, low_balance_threshold,
         created_ledger, updated_ledger)
+
+beneficiaries(stream_id FK, employee, token, PK(stream_id, employee))
 
 stream_events(id PK, stream_id FK, kind, ledger, timestamp, tx_hash,
               amount, refund_amount, old_rate, new_rate, status, remaining, threshold)
