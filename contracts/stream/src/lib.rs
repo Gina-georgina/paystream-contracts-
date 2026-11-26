@@ -47,8 +47,8 @@ use storage::{
 };
 use types::{
     AutoTopupConfig, PendingUpgrade, SplitBeneficiary,
-    ERR_ARCHIVE_TOO_EARLY, ERR_BELOW_MIN_DEPOSIT, ERR_INVALID_AUTO_TOPUP, ERR_INVALID_RATE, ERR_NO_AUTO_TOPUP, ERR_NO_PENDING_UPGRADE, ERR_STOP_TIME_PAST, ERR_STREAM_NOT_ENDED, ERR_UPGRADE_TIMELOCK_ACTIVE, ERR_ZERO_RATE,
-    DataKey, LinearVestSchedule, Stream, StreamParams, StreamStatus, StreamType,
+    ERR_ARCHIVE_TOO_EARLY, ERR_BELOW_MIN_DEPOSIT, ERR_INVALID_AUTO_TOPUP, ERR_INVALID_RATE, ERR_NO_AUTO_TOPUP, ERR_NO_PENDING_UPGRADE, ERR_STOP_TIME_PAST, ERR_STOP_TIME_TOO_FAR, ERR_STREAM_NOT_ENDED, ERR_UPGRADE_TIMELOCK_ACTIVE, ERR_ZERO_RATE,
+    DataKey, LinearVestSchedule, MAX_STOP_TIME_OFFSET, Stream, StreamParams, StreamStatus, StreamType,
     ERR_ADMIN_NOT_SET, ERR_BAD_PENDING_NONCE,
     ERR_BATCH_TOO_LARGE, ERR_CONTRACT_PAUSED, ERR_EMPTY_PARAMS, ERR_NEW_EMPLOYER_IS_EMPLOYEE, ERR_NOT_ADMIN,
     ERR_INVALID_STOP_TIME, ERR_NOT_EMPLOYEE, ERR_NOT_EMPLOYER, ERR_NOT_PENDING_ADMIN,
@@ -469,6 +469,7 @@ impl StreamContract {
             &employee,
         );
         validate_cliff(cliff_time, stop_time);
+        validate_stop_time_cap(stop_time, now);
         // A cliff that has already passed is a no-op.
         let cliff = cliff_time.filter(|c| *c > now);
 
@@ -755,6 +756,12 @@ impl StreamContract {
                     "stream[{}]: {}",
                     index,
                     ERR_STOP_TIME_PAST
+                );
+                assert!(
+                    p.stop_time <= now.saturating_add(MAX_STOP_TIME_OFFSET),
+                    "stream[{}]: {}",
+                    index,
+                    ERR_STOP_TIME_TOO_FAR
                 );
             }
             validate_cliff(p.cliff_time, p.stop_time);
@@ -2962,6 +2969,54 @@ impl StreamContract {
             position += 1;
         }
         page
+    }
+
+    /// Return a page of stream IDs funded with `token`, using cursor pagination (SC-51).
+    ///
+    /// Streams are returned in ascending stream-ID order, consistent with
+    /// [`streams_by_employee_paginated`] and [`get_streams_by_status`]. Pass the
+    /// last ID of the previous page as `start_after` to fetch the next page;
+    /// pass `0` to start from the beginning.
+    ///
+    /// `limit` is capped at the configured max batch size (default 50).
+    ///
+    /// # Parameters
+    /// - `token` — token contract address to query
+    /// - `start_after` — exclusive lower bound on stream ID (0 for the first page)
+    /// - `limit` — maximum number of IDs to return (capped at max batch size)
+    ///
+    /// # Returns
+    /// `Vec<u64>` page of stream IDs in ascending order.
+    pub fn streams_by_token(env: Env, token: Address, start_after: u64, limit: u64) -> Vec<u64> {
+        let limit = limit.min(get_max_batch_size(&env) as u64);
+        storage::token_streams_page(&env, &token, start_after, limit)
+    }
+
+    /// Return a page of stream IDs with the given `status`, using cursor
+    /// pagination (SC-52).
+    ///
+    /// Streams are returned in ascending stream-ID order, consistent with
+    /// [`streams_by_token`] and [`streams_by_employee_paginated`]. Pass the last
+    /// ID of the previous page as `start_after` to fetch the next page; pass `0`
+    /// to start from the beginning.
+    ///
+    /// `limit` is capped at the configured max batch size (default 50).
+    ///
+    /// # Parameters
+    /// - `status` — status to filter by
+    /// - `start_after` — exclusive lower bound on stream ID (0 for the first page)
+    /// - `limit` — maximum number of IDs to return (capped at max batch size)
+    ///
+    /// # Returns
+    /// `Vec<u64>` page of stream IDs in ascending order.
+    pub fn get_streams_by_status(
+        env: Env,
+        status: StreamStatus,
+        start_after: u64,
+        limit: u64,
+    ) -> Vec<u64> {
+        let limit = limit.min(get_max_batch_size(&env) as u64);
+        storage::streams_by_status_page(&env, &status, start_after, limit)
     }
 
     /// Return the number of streams funded with `token`.

@@ -51,6 +51,22 @@ pub fn validate_create_stream(
     assert!(employer != employee, "employer and employee must differ");
 }
 
+/// Validate that `stop_time` does not exceed the maximum 10-year window from `now`.
+///
+/// A `stop_time` of 0 means "no stop time" and is always allowed.
+///
+/// # Panics
+/// - E030 if `stop_time` is non-zero and exceeds `now + MAX_STOP_TIME_OFFSET`
+pub fn validate_stop_time_cap(stop_time: u64, now: u64) {
+    if stop_time > 0 {
+        assert!(
+            stop_time <= now.saturating_add(MAX_STOP_TIME_OFFSET),
+            "{}",
+            ERR_STOP_TIME_TOO_FAR
+        );
+    }
+}
+
 /// Validate an optional cliff against the stream's stop time (PROD-17).
 ///
 /// # Panics
