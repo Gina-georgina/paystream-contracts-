@@ -329,7 +329,9 @@ impl StreamContract {
         assert_eq!(admin, stored_admin, "{}", ERR_NOT_ADMIN);
         consume_admin_nonce(&env, nonce);
         assert!(amount > 0, "{}", ERR_ZERO_DEPOSIT);
+        let old_amount = get_min_deposit(&env);
         set_min_deposit(&env, amount);
+        events::min_deposit_updated(&env, old_amount, amount);
     }
 
     /// Set the maximum number of streams an employer may create per ledger.
@@ -402,6 +404,7 @@ impl StreamContract {
         assert!(fee_bps <= 100, "protocol fee cannot exceed 100 basis points");
         consume_admin_nonce(&env, nonce);
         set_protocol_fee(&env, fee_bps, &treasury);
+        events::protocol_fee_updated(&env, fee_bps, &treasury);
     }
 
     /// Employer creates a salary stream and deposits funds into the contract escrow.
@@ -1030,6 +1033,111 @@ impl StreamContract {
         }
 
         pay_recipients(&env, &stream, amount);
+        maybe_auto_topup(&env, &mut stream, now);
+
+        stream.locked = false;
+        save_stream(&env, &stream);
+        events::withdrawn(&env, stream_id, &employee, amount);
+        let remaining = stream.deposit - stream.withdrawn;
+        if stream.low_balance_threshold > 0 && remaining < stream.low_balance_threshold {
+            events::low_balance(
+                &env,
+                stream_id,
+                &stream.employer,
+                remaining,
+                stream.low_balance_threshold,
+            );
+        }
+        amount
+    }
+
+    /// Employee withdraws up to a requested amount from a stream (SC-81).
+    ///
+    /// Behaves like [`withdraw`] but caps the transferred amount at
+    /// `requested_amount` instead of always claiming everything. The
+    /// remainder, if any, stays claimable and can be withdrawn later. Useful
+    /// for partial payouts.
+    ///
+    /// # Parameters
+    /// - `employee` — employee address; must authenticate (requires auth)
+    /// - `stream_id` — ID of the stream to withdraw from
+    /// - `requested_amount` — amount to withdraw, capped at the claimable total
+    ///
+    /// # Returns
+    /// The actual amount transferred (`min(requested_amount, claimable)`).
+    ///
+    /// # Errors
+    /// - Panics if contract is paused
+    /// - E015 if stream not found
+    /// - E016 if caller is not the receipt holder
+    /// - E017 if stream is not Active/Exhausted
+    /// - E023 if `requested_amount` is not positive
+    /// - E036 if `requested_amount` exceeds the claimable amount
+    /// - E003 if a reentrant withdraw is detected
+    pub fn withdraw_amount(
+        env: Env,
+        employee: Address,
+        stream_id: u64,
+        requested_amount: i128,
+    ) -> i128 {
+        employee.require_auth();
+        assert!(!get_paused(&env), "{}", ERR_CONTRACT_PAUSED);
+        assert!(requested_amount > 0, "{}", ERR_AMOUNT_NOT_POSITIVE);
+        let mut stream = load_stream(&env, stream_id).expect(ERR_STREAM_NOT_FOUND);
+        assert_eq!(
+            receipt_owner(&env, &stream),
+            employee,
+            "{}",
+            ERR_NOT_EMPLOYEE
+        );
+        assert!(
+            stream.status == StreamStatus::Active || stream.status == StreamStatus::Exhausted,
+            "{}",
+            ERR_STREAM_NOT_ACTIVE
+        );
+
+        let now = env.ledger().timestamp();
+        if let Some(c) = mark_cliff_reached(&env, stream.id, now) {
+            events::cliff_reached(&env, stream.id, c);
+        }
+        let claimable = stream_claimable_amount(&env, &stream, now);
+        assert!(requested_amount <= claimable, "{}", ERR_EXCEEDS_CLAIMABLE);
+
+        if claimable == 0 {
+            if stream.status == StreamStatus::Active
+                && stream.stop_time > 0
+                && now >= stream.stop_time
+            {
+                stream.status = StreamStatus::Exhausted;
+                save_stream(&env, &stream);
+                events::stream_status_changed(&env, stream_id, &StreamStatus::Exhausted);
+            }
+            return 0;
+        }
+
+        assert!(!stream.locked, "{}", ERR_REENTRANT);
+        stream.locked = true;
+        save_stream(&env, &stream);
+
+        let amount = requested_amount;
+        stream.withdrawn = stream
+            .withdrawn
+            .checked_add(amount)
+            .expect(ERR_OVERFLOW);
+        // Only advance the accrual clock and clear banked accrual when the
+        // full claimable amount was withdrawn; a partial withdraw leaves the
+        // remainder claimable from the same accrual point.
+        if amount == claimable {
+            stream.last_withdraw_time = accrual_start(&env, stream.id, now);
+            stream.pending_accrual = 0;
+        }
+        if stream.withdrawn >= stream.deposit {
+            set_stream_ended_at(&env, stream_id, now);
+            stream.status = StreamStatus::Exhausted;
+        }
+
+        let token_client = token::Client::new(&env, &stream.token);
+        token_client.transfer(&env.current_contract_address(), &employee, &amount);
         maybe_auto_topup(&env, &mut stream, now);
 
         stream.locked = false;
@@ -1829,7 +1937,7 @@ impl StreamContract {
         let now = env.ledger().timestamp();
         let ended_at = get_stream_ended_at(&env, stream_id).unwrap_or(0);
         assert!(
-            ended_at > 0 && now >= ended_at.saturating_add(ARCHIVE_WAIT_PERIOD),
+            ended_at > 0 && now >= ended_at.saturating_add(get_archive_wait_period(&env)),
             "{}",
             ERR_ARCHIVE_TOO_EARLY
         );
@@ -2011,7 +2119,7 @@ impl StreamContract {
                 continue;
             }
             // 2. Grace period must have elapsed.
-            if now <= stream.stop_time.saturating_add(GRACE_PERIOD) {
+            if now <= stream.stop_time.saturating_add(get_grace_period(&env)) {
                 continue;
             }
             // 3. Must still be Active (Paused streams could have pending accrual).
@@ -2904,6 +3012,23 @@ impl StreamContract {
         get_protocol_fee(&env)
     }
 
+    /// Return the employer's stream-creation budget for the current ledger (SC-84).
+    ///
+    /// Lets employers (and dashboards) discover how many more streams they may
+    /// create before hitting the per-ledger rate limit.
+    ///
+    /// # Parameters
+    /// - `employer` — employer address to query
+    ///
+    /// # Returns
+    /// `(used, limit)` — streams already created by `employer` in the current
+    /// ledger, and the configured per-ledger maximum.
+    pub fn max_creates_per_ledger_query(env: Env, employer: Address) -> (u32, u32) {
+        let used = get_employer_create_count(&env, &employer);
+        let limit = get_max_creates_per_ledger(&env);
+        (used, limit)
+    }
+
     /// Return all stream IDs owned by `employer`.
     ///
     /// # Parameters
@@ -3043,7 +3168,7 @@ impl StreamContract {
         let now = env.ledger().timestamp();
 
         // Grace period must have elapsed since stop_time.
-        if now < stream.stop_time.saturating_add(GRACE_PERIOD) {
+        if now < stream.stop_time.saturating_add(get_grace_period(&env)) {
             return false;
         }
 
