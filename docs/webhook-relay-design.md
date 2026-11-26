@@ -193,3 +193,10 @@ decimal strings in the payload, matching the schema above.
 - [x] Security: HMAC signing, TLS only — §Security
 - [x] API: registration endpoint, payload schema — §API, §Event payload schema
 - [x] Complexity estimate — §Implementation complexity estimate
+
+## Acceptance criteria mapping (issue #413, BE-12)
+
+- [x] Subscribes to `low_bal` and `stream_near_expiry` — §Notification service §1
+- [x] Per-recipient preferences and channels (email/push/in-app) — §Notification service §2
+- [x] Throttle to avoid duplicate alerts per stream — §Notification service §3
+- [x] Delivery and opt-out auditable — §Notification service §4

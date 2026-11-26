@@ -65,6 +65,43 @@
       "returns": "()"
     },
     {
+      "name": "set_token_allowed",
+      "params": [
+        {
+          "name": "admin",
+          "type": "Address"
+        },
+        {
+          "name": "nonce",
+          "type": "u64"
+        },
+        {
+          "name": "token",
+          "type": "Address"
+        },
+        {
+          "name": "allowed",
+          "type": "bool"
+        }
+      ],
+      "returns": "()"
+    },
+    {
+      "name": "get_token_allowlist",
+      "params": [],
+      "returns": "Vec<Address>"
+    },
+    {
+      "name": "is_token_allowed",
+      "params": [
+        {
+          "name": "token",
+          "type": "Address"
+        }
+      ],
+      "returns": "bool"
+    },
+    {
       "name": "get_stream_metadata",
       "description": "Query the structured metadata map for a stream.",
       "params": [
