@@ -295,6 +295,20 @@ pub enum DataKey {
     LastCreateLedger(Address),
     /// Split stream beneficiaries: stream ID → Vec<SplitBeneficiary> for multi-recipient streams (PROD-22).
     SplitBeneficiaries(u64),
+    /// Version stamp for emitted contract events (SC-90). Stored in instance
+    /// storage as a `u32` so indexers can detect the event schema version
+    /// without a resync. Set on initialize/migrate.
+    ContractEventVersion,
+    /// Composite index: (employer address, token address) → Vec<u64> of stream
+    /// IDs funded by that employer with that token (SC-110). Backfilled by
+    /// `migrate` for legacy streams.
+    StreamsByEmployerAndToken(Address, Address),
+    /// Version of the index backfill performed by `migrate` (SC-94). Stored in
+    /// instance storage as a `u32`; gates idempotent index rebuilds.
+    MigrateVersion,
+    /// Cursor for the bounded, resumable index backfill in `migrate` (SC-94).
+    /// Holds the next stream ID to process; removed once backfill completes.
+    MigrateCursor,
     /// Structured stream metadata (e.g. department, cost center) for payroll
     /// categorization: stream ID → Map<Symbol, Symbol>. Stored apart from
     /// `Stream` so existing persisted streams stay decodable. See #467.
@@ -410,6 +424,16 @@ pub const ERR_TEMPLATE_NOT_FOUND: &str = "E031: template not found";
 pub const ERR_CLIFF_AFTER_STOP: &str = "E035: cliff_time must be <= stop_time";
 /// Maximum number of streams in one batch call (create/cancel/pause/resume).
 pub const MAX_BATCH_SIZE: u32 = 50;
+
+/// Current version stamp for emitted contract events (SC-90). Written to
+/// instance storage under `DataKey::ContractEventVersion` on initialize and
+/// migrate so indexers can detect the event schema version.
+pub const CONTRACT_EVENT_VERSION: u32 = 1;
+
+/// Current version of the index backfill performed by `migrate` (SC-94).
+/// Written to instance storage under `DataKey::MigrateVersion`; used to gate
+/// idempotent index rebuilds for legacy streams.
+pub const MIGRATE_VERSION: u32 = 1;
 
 /// Lower bound for the admin-configurable maximum batch size (#483).
 pub const MIN_MAX_BATCH_SIZE: u32 = 1;

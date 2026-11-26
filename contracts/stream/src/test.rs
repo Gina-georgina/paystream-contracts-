@@ -6293,6 +6293,14 @@ fn test_metadata_create_and_get() {
 /// Metadata can be replaced through the update entrypoint.
 #[test]
 fn test_metadata_update_replaces_map() {
+// ---------------------------------------------------------------------------
+// SC-101 – is_stream_expirable grace-period query
+// ---------------------------------------------------------------------------
+
+/// is_stream_expirable returns (false, seconds_until_eligible) before the
+/// grace period elapses.
+#[test]
+fn test_is_stream_expirable_before_grace_period() {
     let (env, client) = setup();
     let admin = Address::generate(&env);
     let employer = Address::generate(&env);
@@ -6300,6 +6308,33 @@ fn test_metadata_update_replaces_map() {
     let token_id = setup_token(&env, &employer);
 
     client.initialize(&admin);
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let id = client.create_stream(&employer, &employee, &token_id, &10_000, &10, &1_100, &None, &None);
+
+    // Exactly at stop_time: grace period has not started elapsing.
+    env.ledger().with_mut(|l| l.timestamp = 1_100);
+    let (eligible, seconds_until) = client.is_stream_expirable(&id);
+    assert!(!eligible);
+    assert_eq!(seconds_until, crate::GRACE_PERIOD);
+
+    // One second before stop_time + GRACE_PERIOD.
+    env.ledger().with_mut(|l| l.timestamp = 1_100 + crate::GRACE_PERIOD - 1);
+    let (eligible, seconds_until) = client.is_stream_expirable(&id);
+    assert!(!eligible);
+    assert_eq!(seconds_until, 1);
+}
+
+/// is_stream_expirable returns (true, 0) exactly at stop_time + GRACE_PERIOD.
+#[test]
+fn test_is_stream_expirable_at_grace_boundary() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+
     let id = client.create_stream_with_metadata(
         &employer,
         &employee,
@@ -6334,6 +6369,32 @@ fn test_metadata_accepts_max_entries() {
     let token_id = setup_token(&env, &employer);
 
     client.initialize(&admin);
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let id = client.create_stream(&employer, &employee, &token_id, &10_000, &10, &1_100, &None, &None);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_100 + crate::GRACE_PERIOD);
+    let (eligible, seconds_until) = client.is_stream_expirable(&id);
+    assert!(eligible, "stream is eligible exactly at the grace boundary");
+    assert_eq!(seconds_until, 0);
+
+    // Just after the boundary it stays eligible.
+    env.ledger().with_mut(|l| l.timestamp = 1_100 + crate::GRACE_PERIOD + 1);
+    let (eligible, seconds_until) = client.is_stream_expirable(&id);
+    assert!(eligible);
+    assert_eq!(seconds_until, 0);
+}
+
+/// is_stream_expirable is read-only: it must not mutate the stream.
+#[test]
+fn test_is_stream_expirable_is_read_only() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+
     let mut map = soroban_sdk::Map::new(&env);
     for i in 0..crate::MAX_METADATA_ENTRIES {
         let key = soroban_sdk::String::from_slice(&env, "k");
@@ -6385,6 +6446,81 @@ fn test_metadata_rejects_too_many_entries() {
     let token_id = setup_token(&env, &employer);
 
     client.initialize(&admin);
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let id = client.create_stream(&employer, &employee, &token_id, &10_000, &10, &1_100, &None, &None);
+    let before = client.get_stream(&id);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_100 + crate::GRACE_PERIOD);
+    let _ = client.is_stream_expirable(&id);
+
+    let after = client.get_stream(&id);
+    assert_eq!(before.status, after.status);
+    assert_eq!(before.withdrawn, after.withdrawn);
+    assert_eq!(before.last_withdraw_time, after.last_withdraw_time);
+}
+
+// ---------------------------------------------------------------------------
+// SC-110 – get_streams_by_employer_and_token
+// ---------------------------------------------------------------------------
+
+/// Snapshot: the per-token employer view intersects both indexes, keeps
+/// creation order and paginates with a capped limit.
+#[test]
+fn test_get_streams_by_employer_and_token_snapshot() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let other_employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_a = setup_token(&env, &employer);
+    let token_b = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    let a1 = client.create_stream(&employer, &employee, &token_a, &10_000, &10, &0, &None, &None);
+    let b1 = client.create_stream(&employer, &employee, &token_b, &10_000, &10, &0, &None, &None);
+    let a2 = client.create_stream(&employer, &employee, &token_a, &10_000, &10, &0, &None, &None);
+    let a3 = client.create_stream(&employer, &employee, &token_a, &10_000, &10, &0, &None, &None);
+    // A stream owned by a different employer must never appear.
+    let _other = client.create_stream(&other_employer, &employee, &token_a, &10_000, &10, &0, &None, &None);
+
+    let all_a = client.get_streams_by_employer_and_token(&employer, &token_a, &0, &50);
+    assert_eq!(all_a.len(), 3);
+    assert_eq!(all_a.get(0).unwrap(), a1);
+    assert_eq!(all_a.get(1).unwrap(), a2);
+    assert_eq!(all_a.get(2).unwrap(), a3);
+
+    let all_b = client.get_streams_by_employer_and_token(&employer, &token_b, &0, &50);
+    assert_eq!(all_b.len(), 1);
+    assert_eq!(all_b.get(0).unwrap(), b1);
+
+    // Pagination.
+    let page = client.get_streams_by_employer_and_token(&employer, &token_a, &1, &1);
+    assert_eq!(page.len(), 1);
+    assert_eq!(page.get(0).unwrap(), a2);
+
+    let beyond = client.get_streams_by_employer_and_token(&employer, &token_a, &10, &50);
+    assert!(beyond.is_empty());
+
+    // Limit is capped.
+    let capped = client.get_streams_by_employer_and_token(&employer, &token_a, &0, &100);
+    assert_eq!(capped.len(), 3);
+}
+
+/// get_streams_by_employer_and_token is read-only and returns empty for an
+/// unknown token.
+#[test]
+fn test_get_streams_by_employer_and_token_unknown_token_empty() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let unknown_token = Address::generate(&env);
+
+    client.initialize(&admin);
+    assert!(client
+        .get_streams_by_employer_and_token(&employer, &unknown_token, &0, &50)
+        .is_empty());
+}
+
     let mut map = soroban_sdk::Map::new(&env);
     for i in 0..=crate::MAX_METADATA_ENTRIES {
         let mut key_bytes = [0u8; 9];
