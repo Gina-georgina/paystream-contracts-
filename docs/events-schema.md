@@ -8,6 +8,15 @@ Indexer-facing record of event schema changes. **Process:** any PR that adds, re
 
 Each entry lists the event, the change (added field / renamed topic / removed field) and migration steps for indexers.
 
+### v1.2 (2026-10-11) — delegate withdrawals, schedules and immutable streams
+
+| Event | Change | Migration |
+|-------|--------|-----------|
+| `withdraw_to` | Added event `["v1", "withdraw_to", <stream_id>]` with data `[employee, to, amount]` | Indexers tracking withdrawals should also handle `withdraw_to`; the holder's claimable decrements exactly as with `withdraw` |
+| `rate_schedule_set` | Added event `["v1", "rate_sched", <stream_id>]` with data `[schedule]` (`Vec<(u64, i128)>`) | Indexers may ignore this event; the active rate still advances via `rate_upd` at each scheduled timestamp |
+| `milestone_schedule_set` | Added event `["v1", "ms_sched", <stream_id>]` with data `[schedule]` (`Vec<(u64, u32)>`, fractions in basis points) | Indexers may ignore this event; claimable amounts are derived from the schedule |
+| `stream_immutable` | Added event `["v1", "immutable", <stream_id>]` with data `[immutable]` (`bool`) | Indexers should treat streams with `immutable == true` as non-cancellable and non-pausable |
+
 ### v1.1 (2026-10-04) — stream metadata and split vest streams
 
 | Event | Change | Migration |
@@ -108,6 +117,92 @@ Emitted when an employee withdraws tokens from a stream.
 
 ---
 
+### withdraw_to
+
+Emitted when the receipt holder withdraws tokens directly to a different
+recipient address (#448). The holder's claimable decrements exactly as with
+`withdraw`; the tokens are transferred to `to`.
+
+**Topic**: `["v1", "withdraw_to", <stream_id>]`
+
+**Data**:
+- `employee` (Address): The receipt holder authorizing the withdrawal
+- `to` (Address): The recipient of the withdrawn tokens
+- `amount` (i128): Amount withdrawn
+
+**Example**:
+```json
+{
+  "topic": ["v1", "withdraw_to", 1],
+  "data": ["GEFGH...", "GSVGS...", 500000]
+}
+```
+
+---
+
+### rate_schedule_set
+
+Emitted when a forward rate schedule is set on a stream via
+`create_stream` / `update_rate_schedule` (#447). The schedule is sorted by
+timestamp and validated for gaps/overlaps.
+
+**Topic**: `["v1", "rate_sched", <stream_id>]`
+
+**Data**:
+- `schedule` (Vec<(u64, i128)>): Sorted `(timestamp, rate_per_second)` pairs
+
+**Example**:
+```json
+{
+  "topic": ["v1", "rate_sched", 1],
+  "data": [[1767225600, 1000000], [1769904000, 2000000]]
+}
+```
+
+---
+
+### milestone_schedule_set
+
+Emitted when a milestone vesting schedule is set on a stream (#446). Each
+entry vests a fraction of the total at the given timestamp.
+
+**Topic**: `["v1", "ms_sched", <stream_id>]`
+
+**Data**:
+- `schedule` (Vec<(u64, u32)>): Sorted `(timestamp, fraction_bps)` pairs;
+  fractions are in basis points (0–10000) and sum to at most 10000
+
+**Example**:
+```json
+{
+  "topic": ["v1", "ms_sched", 1],
+  "data": [[1767225600, 2500], [1782864000, 5000]]
+}
+```
+
+---
+
+### stream_immutable
+
+Emitted when a stream is created with the immutable flag (#445). Immutable
+streams cannot be cancelled or paused by the employer; funds remain
+withdrawable by the employee and top-ups are still allowed.
+
+**Topic**: `["v1", "immutable", <stream_id>]`
+
+**Data**:
+- `immutable` (bool): `true` when the stream is locked against cancel/pause
+
+**Example**:
+```json
+{
+  "topic": ["v1", "immutable", 1],
+  "data": true
+}
+```
+
+---
+
 ### stream_status_changed
 
 Emitted when a stream's status changes (Active, Paused, Cancelled, Exhausted).
@@ -187,12 +282,14 @@ Emitted when a stream is cancelled, recording the exact cash-flow split.
 **Data**:
 - `claimable_amount` (i128): Tokens paid to the employee at cancellation time
 - `refund_amount` (i128): Tokens returned to the employer (unstreamed portion)
+- `fee_refund` (i128): Protocol fee refunded to the employer, proportional to the
+  unstreamed deposit (SC-68). `0` when no fee was charged or nothing was unstreamed.
 
 **Example**:
 ```json
 {
   "topic": ["v1", "cancelled", 1],
-  "data": [300000, 700000]
+  "data": [300000, 700000, 3500]
 }
 ```
 
@@ -296,6 +393,28 @@ Emitted when a stream's rate_per_second is changed.
 
 ---
 
+### stop_time_updated
+
+Emitted when a stream's stop time is changed via `update_stop_time` or
+`update_stop_time_batch` (SC-63). The batch entrypoint emits one event per
+stream in the batch; the batch is all-or-nothing, so either every stream in
+the batch emits this event or none do.
+
+**Topic**: `["v1", "stop_upd", <stream_id>]`
+
+**Data**:
+- `stop_time` (u64): The new stop time (0 clears the stop time)
+
+**Example**:
+```json
+{
+  "topic": ["v1", "stop_upd", 1],
+  "data": [1767225600]
+}
+```
+
+---
+
 ### cliff_reached
 
 Emitted once per stream the first time it is touched (`withdraw`,
@@ -382,6 +501,8 @@ Emitted when a pending contract upgrade is cancelled.
 | bool | Boolean | `true` or `false` |
 | BytesN<32> | Fixed 32-byte array | `abcd1234...` |
 | StreamStatus enum | Stream status (0-3) | `0`, `1`, `2`, or `3` |
+| Vec<(u64, i128)> | Sorted timestamp/rate pairs | `[[1767225600, 1000000]]` |
+| Vec<(u64, u32)> | Sorted timestamp/fraction (bps) pairs | `[[1767225600, 2500]]` |
 
 ## Indexer Compatibility Guide
 
@@ -438,10 +559,53 @@ function parseV1Event(topic, data) {
 }
 ```
 
+## Indexer Implementation
+
+The off-chain indexer lives in `backend/indexer` (see its `README.md`). It
+polls the Soroban RPC `getEvents` endpoint (falling back to Horizon
+`/events?type=contract`) for the configured stream contract, starting at
+`START_LEDGER`, and persists decoded events to Postgres idempotently on
+`(contract_id, ledger_sequence, event_index)`.
+
+### Event topics decoded by the indexer
+
+The indexer decodes every topic documented above. Versioned events are matched
+on `topic[0] == "v1"` then `topic[1]`; unversioned events are matched on
+`topic[0]` directly.
+
+| Topic key | Event | Notes |
+|-----------|-------|-------|
+| `init` | `contract_initialized` | versioned |
+| `created` | `stream_created` | versioned |
+| `withdraw` | `withdrawn` | versioned |
+| `status` | `stream_status_changed` | versioned |
+| `meta_upd` | `stream_metadata_updated` | versioned (v1.1) |
+| `split_vest` | `split_vest_created` | versioned (v1.1) |
+| `cancelled` | `stream_cancelled` | versioned |
+| `topup` | `topped_up` | versioned |
+| `at_set` | `auto_topup_set` | versioned |
+| `at_up` | `auto_topped_up` | versioned |
+| `paused` | `contract_paused` | versioned |
+| `rate_upd` | `rate_updated` | versioned |
+| `cliff` | `cliff_reached` | versioned |
+| `upg_prop` | `upgrade_proposed` | versioned |
+| `upg_exec` | `upgrade_executed` | versioned |
+| `upg_cncl` | `upgrade_cancelled` | versioned |
+| `receipt` | `receipt` | unversioned |
+| `archived` | `archived` | unversioned |
+| `expired` | `expired` | unversioned |
+| `xfr_strm` | `xfr_strm` | unversioned |
+| `low_bal` | `low_bal` | unversioned |
+
+Unknown topics (including unknown schema versions) are logged and skipped
+without failing ingestion.
+
 ## Schema Migration History
 
 | Version | Date | Changes |
 |---------|------|---------|
+| v1.1 | 2026-10-04 | Added `metadata_updated`, `split_vest_created` |
+| v1.2 | 2026-10-11 | Added `withdraw_to`, `rate_schedule_set`, `milestone_schedule_set`, `stream_immutable` |
 | v1 | 2026-09-27 | Initial schema version |
 
 ## Testing
