@@ -2659,6 +2659,39 @@ impl StreamContract {
         receipt_owner(&env, &stream)
     }
 
+    /// Return stream IDs for which `holder` currently holds the withdraw
+    /// receipt (SC-88).
+    ///
+    /// This is distinct from [`stream_ids_by_employee`], which tracks the
+    /// *original* employee a stream was created for and does not change when
+    /// the receipt is transferred via [`transfer_receipt`]. This query
+    /// reflects the live receipt owner instead, so a buyer of a receipt can
+    /// discover which streams they now have withdraw rights over.
+    ///
+    /// Scans every stream ever created (bounded by [`stream_count`]), since
+    /// receipt transfers are not separately indexed.
+    ///
+    /// # Parameters
+    /// - `holder` — address to check current receipt ownership for
+    ///
+    /// # Returns
+    /// `Vec<u64>` of stream IDs currently held by `holder`, in ascending ID
+    /// order; empty if `holder` holds no receipts.
+    pub fn receipts_by_holder(env: Env, holder: Address) -> Vec<u64> {
+        let mut out: Vec<u64> = Vec::new(&env);
+        let total = Self::stream_count(env.clone());
+        let mut id = 1u64;
+        while id <= total {
+            if let Some(stream) = load_stream(&env, id) {
+                if receipt_owner(&env, &stream) == holder {
+                    out.push_back(id);
+                }
+            }
+            id += 1;
+        }
+        out
+    }
+
     /// Transfer a stream's receipt, and with it the right to withdraw future
     /// earnings, from `from` to `to` (PROD-01).
     ///
@@ -2764,6 +2797,61 @@ impl StreamContract {
     pub fn list_templates(env: Env, employer: Address) -> Vec<(u32, StreamParams)> {
         let mut out = Vec::new(&env);
         for id in get_template_ids(&env, &employer).iter() {
+            if let Some(p) = load_template(&env, &employer, id) {
+                out.push_back((id, p));
+            }
+        }
+        out
+    }
+
+    /// Return the number of templates saved by `employer` (SC-89).
+    ///
+    /// Avoids loading every template's `StreamParams` just to count them.
+    ///
+    /// # Parameters
+    /// - `employer` — template owner to query
+    ///
+    /// # Returns
+    /// `u32` count; 0 if the employer has no saved templates.
+    pub fn template_count(env: Env, employer: Address) -> u32 {
+        get_template_ids(&env, &employer).len()
+    }
+
+    /// Return a page of templates saved by `employer` as `(template_id, params)`
+    /// pairs, ordered by template ID (SC-89).
+    ///
+    /// Unlike [`list_templates`], which returns every template in one call,
+    /// this bounds the amount of work and storage reads per invocation so
+    /// employers with many templates do not blow the instruction budget.
+    /// `limit` is capped at 50.
+    ///
+    /// # Parameters
+    /// - `employer` — template owner to query
+    /// - `start_after` — template ID to start after (exclusive); pass the
+    ///   last `template_id` returned by the previous page, or omit to start
+    ///   from the beginning
+    /// - `limit` — maximum number of templates to return (capped at 50)
+    ///
+    /// # Returns
+    /// `Vec<(u32, StreamParams)>` page of templates in ascending ID order.
+    pub fn list_templates_paginated(
+        env: Env,
+        employer: Address,
+        start_after: Option<u32>,
+        limit: u32,
+    ) -> Vec<(u32, StreamParams)> {
+        let capped_limit = limit.min(50);
+        let mut out: Vec<(u32, StreamParams)> = Vec::new(&env);
+        let threshold = start_after;
+        for id in get_template_ids(&env, &employer).iter() {
+            if out.len() >= capped_limit {
+                break;
+            }
+            if let Some(after) = threshold {
+                if id <= after {
+                    continue;
+                }
+            }
             if let Some(p) = load_template(&env, &employer, id) {
                 out.push_back((id, p));
             }
@@ -3216,6 +3304,30 @@ impl StreamContract {
     /// `u64` count; 0 if the address has no streams.
     pub fn stream_count_by_employee(env: Env, employee: Address) -> u64 {
         stream_ids_by_employee(&env, &employee).len() as u64
+    }
+
+    /// Return the lifetime total already withdrawn across all of `employee`'s
+    /// streams (SC-87).
+    ///
+    /// Sums `Stream.withdrawn` over the employee's indexed streams, giving an
+    /// earnings-to-date figure for dashboards/reporting. Iteration is bounded
+    /// by the employee's own stream count (via [`stream_ids_by_employee`]),
+    /// not by the total number of streams in the contract.
+    ///
+    /// # Parameters
+    /// - `employee` — employee address to query
+    ///
+    /// # Returns
+    /// `i128` sum of `withdrawn` across the employee's streams; 0 if the
+    /// employee has no streams.
+    pub fn total_withdrawn_by_employee(env: Env, employee: Address) -> i128 {
+        let mut total: i128 = 0;
+        for stream_id in stream_ids_by_employee(&env, &employee).iter() {
+            if let Some(stream) = load_stream(&env, stream_id) {
+                total = total.checked_add(stream.withdrawn).expect(ERR_OVERFLOW);
+            }
+        }
+        total
     }
 
     /// Return a page of stream IDs funded with `token`.
