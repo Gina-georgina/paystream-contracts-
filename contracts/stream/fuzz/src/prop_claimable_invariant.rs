@@ -1,12 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Property-based tests for the invariant: claimable(stream_id) <= deposit - withdrawn
-//! (TEST-22, issue #245).
+//! (TEST-22, issue #245; extended for SEC-37, issue #583).
 //!
 //! The invariant must hold for all possible combinations of deposit, rate,
 //! elapsed time, stop time, and stream status. Each property runs at least
 //! 10,000 cases. The suite uses a fixed proptest seed via PROPTEST_SEED for
 //! reproducible CI runs.
+//!
+//! SEC-37 formal verification summary (see `contracts/stream/kani/`):
+//!   - `kani_claimable_payroll`: proves `claimable_amount(s, now) <= deposit - withdrawn`
+//!     for all payroll streams (Active status) with bounded symbolic inputs.
+//!   - `kani_claimable_linear_vest`: proves
+//!     `linear_vest_claimable_amount(s, sched, now) <= total_grant - withdrawn`.
+//!   - `kani_rate_times_elapsed_no_overflow`: proves `rate_per_second * elapsed`
+//!     never overflows i128 for the accepted input domain (rate <= 1e9,
+//!     elapsed <= u64::MAX / 4).
+//!   - `kani_withdrawn_plus_claimable_no_overflow`: proves `withdrawn + claimable`
+//!     never overflows i128 and never exceeds `deposit`.
+//! All four harnesses pass under `cargo kani` (results recorded in
+//! `contracts/stream/kani/RESULTS.md`). The properties below mirror those
+//! harnesses in proptest form so regressions are caught in normal CI.
 //!
 //! Run with:
 //!   cargo test --package paystream-stream-fuzz --bin prop_claimable_invariant

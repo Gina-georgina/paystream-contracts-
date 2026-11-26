@@ -51,7 +51,6 @@ Stream record `S`:
 ### 2.2 Split beneficiaries
 
 A stream may carry `splits`, a list of `(beneficiary, bps)` pairs where each `bps` is in basis points (1 bps = 0.01%). Splits are allowed on payroll streams and on linear vest streams. The list is valid when it is non-empty, every `bps > 0`, every beneficiary is distinct, and `Σ bps ≤ 10000`. The remainder `10000 − Σ bps` (if any) accrues to `S.employee`. When `splits` is empty, the whole claimable amount goes to `S.employee`.
-=======
 
 ## 3. Accrual formula
 
@@ -133,9 +132,11 @@ sequenceDiagram
 
 ### 4.2 Withdraw
 
-`withdraw(S)` requires `auth(S.employee)`, `¬paused`, and `S.status ∈ {Active, Exhausted}`.
+`withdraw(S)` requires `auth(S.receiptHolder)`, `¬paused`, and `S.status ∈ {Active, Exhausted}`.
 
-Effect: let `c = claimable(S, t)`. Then `c` tokens are distributed: each split beneficiary `b` receives `share(b, S, t)` and the employee receives the remainder. `W ← W + c`, `last ← end(t)`, `B ← 0`. If `W = D`, then `status ← Exhausted`.
+Effect: let `c = claimable(S, t)`. Then `c` tokens are distributed: each split beneficiary `b` receives `share(b, S, t)` and the employee receives the remainder. If `S.split` is empty, all `c` go to `S.receiptHolder`; otherwise each beneficiary `(p, share)` receives `floor(c · share)` and the remainder goes to `S.receiptHolder`. Then `W ← W + c`, `last ← end(t)`, `B ← 0`. If `W = D`, then `status ← Exhausted`.
+
+Split beneficiaries are honoured regardless of who holds the receipt: a receipt transfer changes only who may call `withdraw` and who receives the non-split remainder, never the beneficiaries' shares.
 
 `withdrawTo(S, to)` requires `auth(S.employee)`, `¬paused`, and `S.status ∈ {Active, Exhausted}`. It is identical to `withdraw(S)` except that the employee's portion (the remainder after split shares) is transferred to `to` instead of to `S.employee`. Split beneficiaries are unaffected and still receive their shares. The operation emits an event naming `to`. `to` need not be the employee; the employee's authorisation is what matters, so a compromised `to` cannot move funds without the employee's signature.
 
@@ -337,7 +338,7 @@ For every stream `S` and every reachable state:
 1. **Solvency:** `0 ≤ W ≤ D`.
 2. **Bounded claim:** `claimable(S, t) ≤ D − W`.
 3. **No over-withdrawal:** the employee has received exactly `W` in total, so the sum of all withdrawals is at most `D`.
-4. **Earned funds are protected from the employer:** no operation authorised only by the employer moves `claimable(S, t)` to anyone but the employee. Cancel pays `claimable` to the employee before refunding the employer.
+4. **Earned funds are protected from the employer:** no operation authorised only by the employer moves `claimable(S, t)` to anyone but the employee (or, on a split stream, the beneficiaries and receipt holder per §4.2). Cancel pays `claimable` to the employee before refunding the employer.
 5. **Monotonic accrual:** for `t₁ ≤ t₂` with no operations in between, `earned(S, t₁) ≤ earned(S, t₂)`.
 6. **Terminal states:** `Cancelled` and `Exhausted` have `claimable = 0` and accept no further accrual.
 7. **Conservation:** the protocol's token balance is at least `Σ (D − W)` over all non-terminal streams.

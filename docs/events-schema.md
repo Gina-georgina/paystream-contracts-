@@ -21,6 +21,7 @@ Each entry lists the event, the change (added field / renamed topic / removed fi
 
 | Event | Change | Migration |
 |-------|--------|-----------|
+| `cancelled` | Added optional `reason` (Symbol) at data[2], carrying a standard `CancelReason` value. Advisory only — not enforced on-chain | Treat missing `reason` (events before v1.1) as `"other"` |
 | `metadata_updated` | Added event `["v1", "meta_upd", <stream_id>]` with data `[metadata]` (`Map<Symbol, Symbol>`, bounded size) | Indexers that do not need metadata may ignore this event; treat streams without it as having empty metadata |
 | `split_vest_created` | Added event `["v1", "split_vest", <stream_id>]` with data `[employer, employee, rate, beneficiary, beneficiary_bps]` | Indexers that only handle `created` should also handle `split_vest` to track linear-vest split streams |
 
@@ -312,6 +313,19 @@ Emitted when a stream is cancelled, recording the exact cash-flow split.
   "data": [300000, 700000, 3500]
 }
 ```
+
+#### CancelReason (standard set)
+
+`cancel_stream` accepts an optional `Symbol` reason for reporting consistency. These values are a documented convention only; the contract stores and emits whatever symbol is passed (or none) and performs **no on-chain enforcement**.
+
+| Symbol | Meaning |
+|--------|---------|
+| `role_ended` | Employment/engagement ended normally |
+| `dispute` | Cancelled due to a disagreement between parties |
+| `error` | Cancelled to correct a mistaken stream configuration |
+| `other` | Any other reason (also the assumed value when no reason is emitted) |
+
+Indexers should map unknown symbols to `other` rather than dropping the event.
 
 ---
 

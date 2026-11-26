@@ -6752,6 +6752,38 @@ fn test_is_stream_expirable_at_grace_boundary() {
     let employer = Address::generate(&env);
     let employee = Address::generate(&env);
     let token_id = setup_token(&env, &employer);
+    let token = paystream_token::TokenContractClient::new(&env, &token_id);
+    let contract_id = client.address.clone();
+
+    client.initialize(&admin);
+    let id = client.create_linear_vest(&employer, &employee, &token_id, &10_000, &100, &None);
+    assert_conservation(&env, &client, &token, id, &contract_id);
+
+    env.ledger().with_mut(|l| l.timestamp += 40);
+    client.withdraw(&employee, &id);
+    assert_conservation(&env, &client, &token, id, &contract_id);
+
+    client.top_up(&employer, &id, &5_000);
+    assert_conservation(&env, &client, &token, id, &contract_id);
+
+    env.ledger().with_mut(|l| l.timestamp += 20);
+    client.cancel_stream(&employer, &id, &None);
+    assert_conservation(&env, &client, &token, id, &contract_id);
+
+    let s = client.get_stream(&id);
+    assert_eq!(s.status, StreamStatus::Cancelled);
+    assert_eq!(s.withdrawn, 6_000);
+}
+
+/// Conservation holds across create → withdraw → settle for a linear vest
+/// stream.
+#[test]
+fn test_conservation_linear_vest_settle() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
 
     client.initialize(&admin);
 
@@ -6782,6 +6814,29 @@ fn test_is_stream_expirable_at_grace_boundary() {
 /// Exactly MAX_METADATA_ENTRIES entries are accepted.
 #[test]
 fn test_metadata_accepts_max_entries() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+    let token = paystream_token::TokenContractClient::new(&env, &token_id);
+    let contract_id = client.address.clone();
+
+    client.initialize(&admin);
+    let id = client.create_linear_vest(&employer, &employee, &token_id, &10_000, &100, &None);
+
+    env.ledger().with_mut(|l| l.timestamp += 100);
+    client.settle(&employer, &id);
+    assert_conservation(&env, &client, &token, id, &contract_id);
+
+    let s = client.get_stream(&id);
+    assert_eq!(s.withdrawn, 10_000);
+    assert_eq!(token.balance(&employee), 10_000);
+}
+
+/// Conservation holds across create → withdraw → transfer for a split stream.
+#[test]
+fn test_conservation_split_stream_lifecycle() {
     let (env, client) = setup();
     let admin = Address::generate(&env);
     let employer = Address::generate(&env);
