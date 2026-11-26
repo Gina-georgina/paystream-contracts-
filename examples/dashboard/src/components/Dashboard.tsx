@@ -10,6 +10,7 @@ import {
   getPaused,
   loadEmployeeStreams,
   loadEmployerStreams,
+  NETWORK,
   shortAddr,
   STREAM_CONTRACT_ID,
   withdraw,
