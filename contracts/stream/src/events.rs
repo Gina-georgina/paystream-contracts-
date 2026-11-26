@@ -246,3 +246,38 @@ pub fn max_creates_per_ledger_updated(env: &Env, max: u32) {
     env.events()
         .publish((symbol_short!("v1"), symbol_short!("rl_upd"),), max);
 }
+
+/// Emitted by `withdraw_to` when the receipt holder directs a withdrawal to a
+/// delegate recipient (SC-80). Topics: `("v1", "wd_to", id)`; data:
+/// `(employee, to, amount)`.
+pub fn withdraw_to(env: &Env, id: u64, employee: &Address, to: &Address, amount: i128) {
+    env.events().publish(
+        (symbol_short!("v1"), symbol_short!("wd_to"), id),
+        (employee.clone(), to.clone(), amount),
+    );
+}
+
+/// Emitted when a stream's forward rate schedule is created or replaced
+/// (SC-79). Data carries the number of `(timestamp, rate)` entries stored.
+pub fn rate_schedule_set(env: &Env, id: u64, entry_count: u32) {
+    env.events().publish(
+        (symbol_short!("v1"), symbol_short!("rate_sch"), id),
+        entry_count,
+    );
+}
+
+/// Emitted when a milestone vesting schedule is created or replaced (SC-78).
+/// Data carries the number of `(timestamp, fraction)` milestones stored.
+pub fn milestone_schedule_set(env: &Env, id: u64, milestone_count: u32) {
+    env.events().publish(
+        (symbol_short!("v1"), symbol_short!("ms_sch"), id),
+        milestone_count,
+    );
+}
+
+/// Emitted when a stream is created with the immutable flag set (SC-77),
+/// making it non-cancellable and non-pausable by the employer.
+pub fn stream_immutable(env: &Env, id: u64) {
+    env.events()
+        .publish((symbol_short!("v1"), symbol_short!("immut"), id), ());
+}

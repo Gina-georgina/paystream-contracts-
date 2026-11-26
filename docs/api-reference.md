@@ -244,8 +244,16 @@ Employer creates a salary stream and deposits funds into the contract escrow.
 | `stop_time` | `u64` | Hard stop timestamp (0 = indefinite) |
 | `low_balance_threshold` | `Option<i128>` | Emit a `low_bal` event after any withdraw that leaves less than this remaining (`None`/0 = disabled) |
 | `cliff_time` | `Option<u64>` | Cliff timestamp (PROD-17). Nothing accrues before it; once passed, accrual runs from `cliff_time` (not from the start). `None`, or a cliff at/before now, means no cliff |
+| `immutable` | `bool` | SC-77. When `true`, the stream is non-cancellable and non-pausable by the employer (e.g. guaranteed salary). Funds remain withdrawable by the employee and top-ups are still allowed |
+| `rate_schedule` | `Option<Vec<(u64, i128)>>` | SC-79. Optional forward schedule of `(timestamp, rate)` pairs, sorted ascending by timestamp. The active rate advances automatically at each timestamp; see `set_rate_schedule` for validation rules |
 
 **Returns:** `u64` — the new stream ID
+
+**Immutable streams (SC-77):** when `immutable` is `true`, `cancel_stream`,
+`cancel_streams_batch`, `pause_stream` and `pause_stream_batch` reject the stream
+with `E036`. `top_up`, `withdraw`, `withdraw_all`, `withdraw_to` and
+`update_rate` continue to work. Read the flag with `is_immutable(stream_id) -> bool`.
+=======
 
 **Cliff behaviour:** `claimable` is 0 while `now < cliff_time`. Withdrawing,
 pausing/resuming or changing the rate before the cliff never moves accrual
@@ -257,6 +265,7 @@ cliff with `get_cliff_time(stream_id) -> Option<u64>`.
 **Errors:**
 - Panics if contract is paused
 - E035 if `cliff_time` > `stop_time` (when `stop_time` is non-zero)
+- E037 if `rate_schedule` is not strictly ascending by timestamp, contains a timestamp in the past, or contains a rate outside `1..=1,000,000,000`
 - E002 if `deposit` ≤ 0
 - E007 if `deposit` < minimum deposit
 - E001 if `rate_per_second` ≤ 0
@@ -275,7 +284,24 @@ stellar contract invoke --id <STREAM_ID> --source <EMPLOYER_KEY> --network testn
     --deposit 1000000 \
     --rate_per_second 100 \
     --stop_time 0 \
-    --low_balance_threshold 100000
+    --low_balance_threshold 100000 \
+    --immutable false \
+    --rate_schedule 'null'
+```
+
+**Example (immutable stream with a rate schedule):**
+```bash
+stellar contract invoke --id <STREAM_ID> --source <EMPLOYER_KEY> --network testnet \
+  -- create_stream \
+    --employer <EMPLOYER_ADDRESS> \
+    --employee <EMPLOYEE_ADDRESS> \
+    --token_address <TOKEN_ID> \
+    --deposit 1000000 \
+    --rate_per_second 100 \
+    --stop_time 0 \
+    --low_balance_threshold 100000 \
+    --immutable true \
+    --rate_schedule '[[1735689600,100],[1738368000,150],[1740787200,200]]'
 ```
 
 ---
@@ -307,9 +333,56 @@ stellar contract invoke --id <STREAM_ID> --source <EMPLOYER_KEY> --network testn
 
 ---
 
-### `get_stream_type`
+### `create_milestone_vest`
 
-Return whether a stream is `Payroll` or `LinearVest`. Existing streams without type metadata are treated as `Payroll`.
+Employer creates a grant that vests in discrete milestones instead of linearly
+(SC-78). Each milestone is a `(timestamp, fraction_bps)` pair: when the ledger
+timestamp reaches `timestamp`, `fraction_bps` basis points of the total grant
+become claimable. Fractions are cumulative — each entry states the total vested
+fraction at that timestamp, not an increment — and must be non-decreasing, end
+at or below 10,000, and be sorted ascending by timestamp. An optional cliff
+delays all claimability until the cliff timestamp.
+
+**Caller:** Employer
+
+| Parameter | Type | Description |
+|---|---|---|
+| `employer` | `Address` | Employer funding the grant |
+| `employee` | `Address` | Grant recipient |
+| `token_address` | `Address` | SEP-41 token contract address |
+| `total_grant` | `i128` | Gross grant amount (must meet minimum deposit) |
+| `milestones` | `Vec<(u64, u32)>` | Sorted `(timestamp, cumulative fraction in bps)` pairs |
+| `cliff_time` | `Option<u64>` | Optional cliff timestamp; nothing is claimable before it |
+
+**Returns:** `u64` — the new stream ID
+
+**Claimable:** `claimable` sums the vested milestones up to `now`:
+`total_grant * vested_bps / 10_000 - withdrawn`, capped at the remaining
+deposit. Before the cliff, claimable is 0. At exactly a milestone timestamp the
+milestone counts as vested.
+
+**Errors:**
+- E002 if `total_grant` ≤ 0
+- E007 if `total_grant` < minimum deposit
+- E038 if `milestones` is empty, not sorted ascending, contains a fraction above 10,000, or contains a decreasing fraction
+- E035 if `cliff_time` is after the last milestone timestamp
+
+**Example:**
+```bash
+stellar contract invoke --id <STREAM_ID> --source <EMPLOYER_KEY> --network testnet \
+  -- create_milestone_vest --employer <EMPLOYER_ADDRESS> \
+  --employee <EMPLOYEE_ADDRESS> --token_address <TOKEN_ID> \
+  --total_grant 1000000 \
+  --milestones '[[1735689600,2500],[1751328000,5000],[1767225600,10000]]' \
+  --cliff_time 1735689600
+```
+
+---
+
+### `get_milestone_schedule`
+
+Return the milestone schedule and cliff for a milestone vest. Returns `None`
+for streams of any other type.
 
 **Caller:** Anyone
 
@@ -317,7 +390,21 @@ Return whether a stream is `Payroll` or `LinearVest`. Existing streams without t
 |---|---|---|
 | `stream_id` | `u64` | Stream to query |
 
-**Returns:** `StreamType` — `Payroll` or `LinearVest`
+**Returns:** `Option<MilestoneSchedule>` — schedule containing `milestones: Vec<(u64, u32)>` and `cliff_time: Option<u64>`
+
+---
+
+### `get_stream_type`
+
+Return whether a stream is `Payroll`, `LinearVest`, or `Milestone`. Existing streams without type metadata are treated as `Payroll`.
+
+**Caller:** Anyone
+
+| Parameter | Type | Description |
+|---|---|---|
+| `stream_id` | `u64` | Stream to query |
+
+**Returns:** `StreamType` — `Payroll`, `LinearVest`, or `Milestone`
 
 ---
 
@@ -545,6 +632,40 @@ is required.
 ```bash
 stellar contract invoke --id <STREAM_ID> --source <KEEPER_KEY> --network testnet \
   -- settle_stream --stream_id 1
+```
+
+---
+
+### `withdraw_to`
+
+Employee withdraws claimable tokens from a stream directly to a different
+recipient address (SC-80), for example a savings wallet. The stream receipt
+holder authorizes the call; the claimable balance decrements exactly as with
+`withdraw`, but the tokens are transferred to `to` instead of the holder.
+
+**Caller:** Employee (stream receipt holder)
+
+| Parameter | Type | Description |
+|---|---|---|
+| `employee` | `Address` | Must match the stream's employee (requires auth) |
+| `stream_id` | `u64` | ID of the stream to withdraw from |
+| `to` | `Address` | Recipient of the withdrawn tokens (requires auth) |
+
+**Returns:** `i128` — amount transferred (0 if nothing claimable)
+
+**Errors:**
+- Panics if contract is paused
+- Panics if stream not found
+- Panics if caller is not the stream's employee
+- Panics if stream is not Active or Exhausted
+- E003 if a reentrant withdraw is detected
+
+**Emitted event:** `withdrew` with the `to` address in the payload (see [events schema](events-schema.md))
+
+**Example:**
+```bash
+stellar contract invoke --id <STREAM_ID> --source <EMPLOYEE_KEY> --network testnet \
+  -- withdraw_to --employee <EMPLOYEE_ADDRESS> --stream_id 1 --to <SAVINGS_ADDRESS>
 ```
 
 ---
@@ -792,6 +913,7 @@ Employer pauses an active stream. Accrual stops until `resume_stream` is called.
 - Panics if stream not found
 - Panics if caller is not the stream's employer
 - Panics if stream is not Active
+- E036 if the stream is immutable (SC-77)
 
 **Example:**
 ```bash
@@ -819,6 +941,7 @@ event is emitted for each stream on success.
 **Errors:**
 - Panics if `stream_ids` is empty or contains more entries than the configured maximum batch size (E029)
 - Panics if any stream is not found, does not belong to `employer`, or is not Active
+- E036 if any stream is immutable (SC-77; reverts entire batch)
 
 **Example:**
 ```bash
@@ -942,6 +1065,73 @@ Withdraw:
 
 ---
 
+### `set_rate_schedule`
+
+Employer installs or replaces a forward schedule of `(timestamp, rate)` pairs
+(SC-79). At each timestamp the active `rate_per_second` advances automatically
+without any employer action. The schedule must be sorted strictly ascending by
+timestamp, every timestamp must be in the future, and every rate must be within
+`1..=1,000,000,000`. Accrual before the first scheduled timestamp uses the
+stream's current `rate_per_second`; gaps between entries keep the previous rate
+active. Calling again replaces the whole remaining schedule.
+
+**Caller:** Employer
+
+| Parameter | Type | Description |
+|---|---|---|
+| `employer` | `Address` | Must match the stream's employer |
+| `stream_id` | `u64` | ID of the stream to update |
+| `schedule` | `Vec<(u64, i128)>` | Sorted `(timestamp, rate)` pairs; empty clears the schedule |
+
+**Returns:** nothing
+
+**Errors:**
+- Panics if stream not found
+- Panics if caller is not the stream's employer
+- Panics if stream is not Active or Paused
+- E037 if the schedule is not strictly ascending, contains a past timestamp, or contains an out-of-range rate
+
+**Emitted event:** `rate_sched` with the new schedule length
+
+**Example:**
+```bash
+stellar contract invoke --id <STREAM_ID> --source <EMPLOYER_KEY> --network testnet \
+  -- set_rate_schedule --employer <EMPLOYER_ADDRESS> --stream_id 1 \
+  --schedule '[[1735689600,100],[1738368000,150]]'
+```
+
+---
+
+### `get_rate_schedule`
+
+Return the remaining forward rate schedule for a stream, sorted ascending by
+timestamp. Returns an empty vector when no schedule is configured.
+
+**Caller:** Anyone
+
+| Parameter | Type | Description |
+|---|---|---|
+| `stream_id` | `u64` | Stream to query |
+
+**Returns:** `Vec<(u64, i128)>` — remaining `(timestamp, rate)` pairs
+
+---
+
+### `is_immutable`
+
+Return whether a stream was created as immutable (SC-77). Immutable streams
+cannot be cancelled or paused by the employer.
+
+**Caller:** Anyone
+
+| Parameter | Type | Description |
+|---|---|---|
+| `stream_id` | `u64` | Stream to query |
+
+**Returns:** `bool` — `true` if the stream is immutable
+
+---
+
 ### `update_stop_time`
 
 Employer changes the hard stop timestamp of an Active stream without cancelling
@@ -992,6 +1182,7 @@ Employer cancels a stream. The employee receives all earned tokens; the employer
 - Panics if stream not found
 - Panics if caller is not the stream's employer
 - Panics if stream is already Cancelled or Exhausted
+- E036 if the stream is immutable (SC-77)
 
 **Emitted event:** `stream_cancelled` (enriched — see [Events](#events) section)
 
@@ -1022,6 +1213,7 @@ Employer cancels multiple streams atomically in a single transaction. All cancel
 - Panics if any stream is not found
 - Panics if any stream does not belong to `employer`
 - Panics if any stream is already Cancelled or Exhausted (reverts entire batch)
+- E036 if any stream is immutable (SC-77; reverts entire batch)
 
 **Example:**
 ```bash
@@ -1060,6 +1252,7 @@ Read the full state of a stream by ID.
 | `status` | `StreamStatus` | Active / Paused / Cancelled / Exhausted |
 | `locked` | `bool` | Reentrancy guard (always false at rest) |
 | `low_balance_threshold` | `i128` | Remaining-deposit threshold for the `low_bal` event (0 = disabled) |
+| `immutable` | `bool` | SC-77. `true` when the employer cannot cancel or pause the stream |
 
 **Errors:**
 - Panics if stream not found
@@ -2088,6 +2281,9 @@ Keep this table in sync with that file (see [CONTRIBUTING.md](../CONTRIBUTING.md
 | E009 | `ERR_BAD_NONCE` | Invalid admin nonce | `propose_admin`, `pause_contract`, `unpause_contract`, `set_min_deposit`, `set_protocol_fee`, `upgrade`, `propose_upgrade`, `execute_upgrade`, `cancel_upgrade` | Read the current value with `admin_nonce` and pass it as `nonce` |
 | E029 | `ERR_BATCH_TOO_LARGE` | Batch contains more entries than the configured maximum batch size (default 50) | `create_streams_batch`, `cancel_streams_batch`, `pause_stream_batch`, `resume_stream_batch`, `get_streams_batch`, `claimable_batch` | Split the operation into batches no larger than the configured maximum (see `set_max_batch_size`) |
 | E030 | `ERR_INVALID_STOP_TIME` | Nonzero stop time precedes last withdrawal | `update_stop_time` | Use 0 or a timestamp at/after `last_withdraw_time` |
+| E036 | `ERR_IMMUTABLE_STREAM` | Stream is immutable and cannot be cancelled or paused | `cancel_stream`, `cancel_streams_batch`, `pause_stream`, `pause_stream_batch` | Immutable streams (SC-77) can only end by exhausting their deposit; create a non-immutable stream if cancellation is required |
+| E037 | `ERR_INVALID_RATE_SCHEDULE` | Rate schedule is unsorted, contains a past timestamp, or has an out-of-range rate | `create_stream`, `set_rate_schedule` | Pass strictly ascending future timestamps with rates in `1..=1,000,000,000` |
+| E038 | `ERR_INVALID_MILESTONES` | Milestone schedule is empty, unsorted, or has non-monotonic / out-of-range fractions | `create_milestone_vest` | Pass ascending timestamps with cumulative fractions in `0..=10,000` |
 | T001 | `ERR_OVERFLOW` (token) | Token arithmetic overflow | Token `mint`, `mint_to_batch`, `transfer`, `transfer_from` | Use smaller amounts |
 | T002 | `ERR_PAUSED` (token) | Token is paused | Token `transfer`, `transfer_from`, `burn`, `burn_from` | Wait for the admin to call `unpause_token` |
 | T003 | `ERR_BATCH_TOO_LARGE` (token) | More than 50 recipients | Token `mint_to_batch` | Split into batches of at most 50 |
@@ -2110,7 +2306,11 @@ stateDiagram-v2
     Exhausted --> [*]
 ```
 
-`update_rate`, `top_up`, and `set_low_balance_threshold` do not change a stream's status.
+`update_rate`, `set_rate_schedule`, `top_up`, and `set_low_balance_threshold` do not change a stream's status.
+
+Immutable streams (SC-77) never enter `Paused` or `Cancelled`: the
+`Active → Paused` and `Active/Paused → Cancelled` transitions are rejected with
+E036. They still transition to `Exhausted` normally.
 
 `settle_stream` (callable by anyone) triggers the Active → Exhausted transition for streams
 whose `stop_time` has passed and whose deposit is fully streamed. `withdraw` performs the

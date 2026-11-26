@@ -3,6 +3,43 @@
   "contract": "stream",
   "functions": [
     {
+      "name": "create_stream",
+      "description": "Create a vesting stream. Supports linear, milestone, and dynamic rate schedules. The immutable flag makes the stream non-cancellable and non-pausable by the employer while funds remain withdrawable by the employee.",
+      "params": [
+        { "name": "sender", "type": "Address" },
+        { "name": "recipient", "type": "Address" },
+        { "name": "token", "type": "Address" },
+        { "name": "total_amount", "type": "i128" },
+        { "name": "start_time", "type": "u64" },
+        { "name": "cliff_time", "type": "u64" },
+        { "name": "end_time", "type": "u64" },
+        { "name": "immutable", "type": "bool" },
+        { "name": "milestone_schedule", "type": "Vec<(u64, u32)>" },
+        { "name": "rate_schedule", "type": "Vec<(u64, i128)>" }
+      ],
+      "returns": "u64"
+    },
+    {
+      "name": "withdraw_to",
+      "description": "Withdraw claimable tokens for a stream directly to a delegate recipient address. Requires auth from the receipt holder; the holder's claimable amount is decremented and the delegate receives the tokens.",
+      "params": [
+        { "name": "employee", "type": "Address" },
+        { "name": "stream_id", "type": "u64" },
+        { "name": "to", "type": "Address" }
+      ],
+      "returns": "i128"
+    },
+    {
+      "name": "set_rate_schedule",
+      "description": "Set a forward schedule of (timestamp, rate) so rate changes auto-apply at configured times. The schedule must be sorted with no gaps or overlaps.",
+      "params": [
+        { "name": "sender", "type": "Address" },
+        { "name": "stream_id", "type": "u64" },
+        { "name": "rate_schedule", "type": "Vec<(u64, i128)>" }
+      ],
+      "returns": "()"
+    },
+    {
       "name": "create_split_vest",
       "description": "Create a linear vest stream whose claimable amount is split among multiple beneficiaries.",
       "params": [
@@ -47,6 +84,39 @@
     }
   ],
   "events": [
+    {
+      "name": "withdraw_to",
+      "description": "Emitted when a receipt holder withdraws claimable tokens to a delegate recipient.",
+      "fields": [
+        { "name": "stream_id", "type": "u64" },
+        { "name": "employee", "type": "Address" },
+        { "name": "to", "type": "Address" },
+        { "name": "amount", "type": "i128" }
+      ]
+    },
+    {
+      "name": "rate_schedule_set",
+      "description": "Emitted when a dynamic rate schedule is configured for a stream.",
+      "fields": [
+        { "name": "stream_id", "type": "u64" },
+        { "name": "rate_schedule", "type": "Vec<(u64, i128)>" }
+      ]
+    },
+    {
+      "name": "milestone_schedule_set",
+      "description": "Emitted when a milestone vesting schedule is configured for a stream.",
+      "fields": [
+        { "name": "stream_id", "type": "u64" },
+        { "name": "milestone_schedule", "type": "Vec<(u64, u32)>" }
+      ]
+    },
+    {
+      "name": "stream_immutable",
+      "description": "Emitted when a stream is created with the immutable flag set.",
+      "fields": [
+        { "name": "stream_id", "type": "u64" }
+      ]
+    },
     {
       "name": "stream_metadata_updated",
       "description": "Emitted when a stream's structured metadata map is updated.",
