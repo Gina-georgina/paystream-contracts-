@@ -5608,6 +5608,57 @@ fn test_create_split_vest_rejects_bad_basis_points() {
     client.create_split_vest(&employer, &token_id, &100_000, &100, &None, &split);
 }
 
+// ---------------------------------------------------------------------------
+// SC-72: get_pending_upgrade query (#440)
+// ---------------------------------------------------------------------------
+
+/// Returns None when no upgrade has been proposed yet.
+#[test]
+fn test_get_pending_upgrade_none_initially() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let result = client.get_pending_upgrade();
+    assert!(result.is_none(), "expected None before any propose_upgrade");
+    env.as_contract(&client.address, || {
+        soroban_sdk::snapshot_writer::write(&env, "test_get_pending_upgrade_none_initially.1");
+    });
+}
+
+/// Returns Some((wasm_hash, unlock_time)) after propose_upgrade.
+#[test]
+fn test_get_pending_upgrade_some_after_propose() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let wasm_hash: soroban_sdk::BytesN<32> = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+    client.propose_upgrade(&wasm_hash, &0);
+
+    let result = client.get_pending_upgrade();
+    assert!(result.is_some(), "expected Some after propose_upgrade");
+    let (stored_hash, unlock_time) = result.unwrap();
+    assert_eq!(stored_hash, wasm_hash, "wasm_hash mismatch");
+    // ledger timestamp starts at 0; TIMELOCK_DELAY = 172800
+    assert_eq!(unlock_time, 172_800u64, "unlock_time mismatch");
+}
+
+/// Returns None after the upgrade proposal is cancelled.
+#[test]
+fn test_get_pending_upgrade_none_after_cancel() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let wasm_hash: soroban_sdk::BytesN<32> = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+    client.propose_upgrade(&wasm_hash, &0);
+    client.cancel_upgrade(&1);
+
+    let result = client.get_pending_upgrade();
+    assert!(result.is_none(), "expected None after cancel_upgrade");
+}
+
 /// Split vest withdraw distributes claimable per basis points.
 #[test]
 fn test_split_vest_withdraw_distributes_claimable() {
