@@ -8,6 +8,9 @@ use crate::types::{
 };
 use soroban_sdk::{Address, Map, Symbol};
 
+/// Maximum number of entries allowed in a single batch operation.
+pub const MAX_BATCH_SIZE: u32 = 50;
+
 /// Maximum allowed rate_per_second (1 billion tokens/s — prevents overflow in
 /// claimable_amount for any realistic elapsed time up to ~292 years).
 pub const MAX_RATE_PER_SECOND: i128 = 1_000_000_000_i128;
