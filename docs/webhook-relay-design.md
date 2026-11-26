@@ -93,10 +93,12 @@ order. Requests time out after 10 s.
 
 ## Retry logic and idempotency
 
-- **Retry:** exponential backoff with full jitter — 1 min, 5 min, 25 min, 2 h, 8 h
-  (5 attempts). HTTP `410` or repeated DNS failure ⇒ retire the webhook to `disabled` state.
-- **Dead letter:** after final failure the event is parked in a DLQ table for 30 days,
-  replayable by the owner via the API.
+- **Retry:** exponential backoff with full jitter — base delays 1 min, 5 min, 25 min, 2 h, 8 h
+  (5 attempts total, i.e. 1 initial delivery + 4 retries). The actual delay for attempt `n` is
+  `random(0, base[n])` (full jitter). HTTP `410` or repeated DNS failure ⇒ retire the webhook to
+  `disabled` state.
+- **Dead letter:** after final failure the event is parked in the `webhook_dead_letters` table
+  for 30 days, replayable by the owner via `POST /v1/webhooks/{id}/dead-letters/{dlq_id}/replay`.
 - **Non-retryable:** HTTP `4xx` other than `408`/`429` ⇒ drop after one attempt, log, count
   against the webhook's failure budget (10 consecutive drops ⇒ auto-disable + notification email).
 - **Idempotency:** at-least-once delivery. Consumers deduplicate on the `Idempotency-Key`
@@ -104,6 +106,10 @@ order. Requests time out after 10 s.
   advances only after the event is durably queued.
 - **Ordering:** best-effort per stream (single dispatcher worker per URL); across URLs no
   ordering guarantee. Documented as such.
+- **Observability:** every attempt is recorded in `webhook_delivery_attempts`
+  (`subscriber_id`, `event_id`, `attempt`, `status_code`, `response_body` (truncated),
+  `error`, `created_at`), exposed via `GET /v1/webhooks/{id}/deliveries`.
+=======
 
 ---
 
@@ -135,6 +141,9 @@ SEP-43-style, nonce-based like the contract admin nonce pattern):
 | `PATCH` | `/v1/webhooks/{id}` | Update `url` / `events` / `active` |
 | `DELETE` | `/v1/webhooks/{id}` | Remove webhook and pending deliveries |
 | `POST` | `/v1/webhooks/{id}/test` | Send a signed `ping` test event |
+| `GET` | `/v1/webhooks/{id}/deliveries` | Per-attempt delivery status (status code, response, timestamp) |
+| `GET` | `/v1/webhooks/{id}/dead-letters` | List dead-lettered events |
+| `POST` | `/v1/webhooks/{id}/dead-letters/{dlq_id}/replay` | Re-enqueue a dead-lettered event |
 
 Validation: max 10 webhooks per employer, max 100 stream subscriptions per webhook, URL length
 ≤ 2 KB. Registration triggers the SSRF check and a mandatory `ping` handshake (endpoint must
@@ -158,103 +167,22 @@ horizontal sharding (single instance is sufficient at current volume).
 
 ---
 
-## Notification service (issue #413, BE-12)
+## Implementation notes (issue #403)
 
-The relay also feeds a **notification service** that turns alert-class contract events into
-per-user email / push / in-app alerts. It reuses the Ingestor, Filter and Transformer stages
-above; only the routing and delivery layers differ from webhooks.
+The v1 relay lives in `backend/src/webhooks/`:
 
-### 1. Subscribed events
+| Module | Responsibility |
+|---|---|
+| `subscribers.ts` | Subscriber registry: `url`, `secret`, `events[]` filter, `active` flag |
+| `signature.ts` | `signPayload(secret, timestamp, rawBody)` → `t=<ts>,v1=<hex>` HMAC-SHA256 |
+| `backoff.ts` | `backoffDelay(attempt)` — full-jitter exponential backoff over the base schedule |
+| `dispatcher.ts` | HTTP delivery, retry loop, dead-lettering, per-attempt recording |
+| `router.ts` | Registration + admin/status endpoints |
 
-The notifier consumes the same canonical event stream (dedupe on `(ledger, tx_hash,
-event_index)`) and reacts to exactly two event types:
-
-| Source event | Notifier trigger | Recipients |
-|---|---|---|
-| `low_bal` | `stream.low_balance` | stream `employer` (top-up reminder) |
-| `stream_near_expiry` | `stream.near_expiry` | stream `employer` and `employee` (renewal / end-of-stream notice) |
-
-All other events are ignored by the notifier (they remain available to webhooks). Payloads are
-the transformer's v1 shape; `stream.near_expiry` carries `stream_id`, `employer`, `employee`,
-`expires_at` and `remaining`.
-
-### 2. Preferences and channel routing
-
-Each recipient (Stellar address) has a notification preference record:
-
-```json
-{
-  "address": "GABC...",
-  "channels": { "email": true, "push": true, "in_app": true },
-  "events": { "stream.low_balance": true, "stream.near_expiry": true },
-  "email": "user@example.com",
-  "push_subscriptions": ["..."],
-  "quiet_hours": { "start": "22:00", "end": "07:00", "tz": "UTC" }
-}
-```
-
-- Routing: for each event, resolve recipients from the stream's indexed `employer`/`employee`,
-  load their preferences, and fan out to every enabled channel for that event type.
-- `in_app` is always persisted (it is the audit record, §4) even when email/push are disabled;
-  disabling `in_app` only hides it from the UI feed.
-- Missing preference record ⇒ defaults (`in_app` on, email/push off) so no user is spammed
-  before they opt in.
-- `quiet_hours` defers email/push (not `in_app`) to the end of the window; deferred alerts are
-  coalesced per stream.
-
-### 3. Throttling (per stream)
-
-To avoid duplicate alerts for the same stream:
-
-- **Dedupe key:** `(stream_id, event_type, recipient, channel)`. A repeat within the throttle
-  window is dropped and counted as `suppressed`.
-- **Windows:** `low_bal` — 24 h per stream per recipient (a stream that stays low does not
-  re-alert every ledger); `stream_near_expiry` — once per stream per recipient (the event fires
-  once, but redeliveries and replays must not re-notify).
-- **Escalation:** if `remaining` drops further below the threshold by ≥ 25 % since the last
-  alert, the throttle is bypassed once (a worsening balance is new information).
-- Throttle state is stored in the same Postgres instance (no new infra), keyed by the dedupe
-  key with a TTL equal to the window.
-
-### 4. Auditability (delivery and opt-out)
-
-Two append-only tables back the acceptance criteria:
-
-- `notification_deliveries`: `id`, `event_id`, `stream_id`, `recipient`, `channel`,
-  `status` (`queued`/`sent`/`failed`/`suppressed`/`deferred`), `attempts`, `provider_message_id`,
-  `error`, `created_at`, `updated_at`. Every fan-out writes one row per channel, including
-  suppressed and deferred ones, so "why didn't I get an alert?" is answerable.
-- `notification_preference_audit`: `address`, `changed_at`, `actor` (self / admin),
-  `before`, `after` — one row per preference mutation, including opt-outs. Opt-out is
-  immediate: pending queued email/push for that address is cancelled and marked `suppressed`.
-
-Delivery uses the same retry/backoff and DLQ semantics as webhooks (§Retry logic and
-idempotency); email/push providers are called with the event `id` as idempotency key.
-
-### 5. API surface
-
-| Method | Path | Purpose |
-|---|---|---|
-| `GET` | `/v1/notifications/preferences` | Read caller's preferences |
-| `PUT` | `/v1/notifications/preferences` | Update channels / event toggles / quiet hours |
-| `POST` | `/v1/notifications/opt-out` | One-call opt-out of all channels (audited) |
-| `GET` | `/v1/notifications` | In-app feed (paginated, caller-scoped) |
-| `GET` | `/v1/notifications/deliveries` | Caller's delivery audit log |
-
-Auth is the same wallet-signature scheme as webhook registration.
-
-### 6. Complexity
-
-| Component | Effort | Notes |
-|---|---|---|
-| Event mapping + recipient resolution | 0.5 wk | Reuses Ingestor/Transformer |
-| Preferences store + routing + quiet hours | 1 wk | Postgres only |
-| Throttling | 0.5 wk | Dedupe-key table with TTL |
-| Channel adapters (email, push, in-app) | 1 wk | Provider integration + templates |
-| Audit tables + API | 0.5 wk | Append-only, no new infra |
-| **Total** | **~3.5 engineer-weeks** | Depends on BE-01 (event schema v1) |
-
-Deferred: SMS channel, per-stream mute lists, digest/batched summaries, provider failover.
+Storage (Postgres): `webhook_subscribers`, `webhook_delivery_attempts`,
+`webhook_dead_letters`. Event routing resolves `employer` from the event data when present and
+otherwise from a cached `get_stream` lookup keyed by stream ID. `i128` amounts are serialized as
+decimal strings in the payload, matching the schema above.
 
 ---
 

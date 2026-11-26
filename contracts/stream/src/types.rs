@@ -24,6 +24,8 @@ pub enum StreamType {
     Payroll,
     /// A fixed grant becomes claimable linearly over a vesting period.
     LinearVest,
+    /// A fixed grant becomes claimable in discrete milestones over time.
+    Milestone,
 }
 
 /// A salary stream: employer deposits funds, employee withdraws per-second.
@@ -60,6 +62,43 @@ pub struct Stream {
     pub low_balance_threshold: i128,
     /// Optional reason for pausing the stream (regulatory compliance and dispute resolution).
     pub pause_reason: Option<soroban_sdk::String>,
+    /// Whether the stream is immutable (non-cancellable, non-pausable by the
+    /// employer). Funds remain withdrawable by the employee. See #445.
+    pub immutable: bool,
+}
+
+/// Lightweight projection of a stream for indexers polling many streams.
+///
+/// Contains only the fields needed to display status and balances, avoiding
+/// the cost of returning the full [`Stream`] struct. See #424.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct StreamSummary {
+    /// Unique sequential stream identifier.
+    pub id: u64,
+    /// Current lifecycle state.
+    pub status: StreamStatus,
+    /// Tokens currently claimable by the employee.
+    pub claimable: i128,
+    /// Tokens still remaining in the stream's deposit.
+    pub remaining: i128,
+    /// Payroll rate in tokens per second; zero for linear vest streams.
+    pub rate: i128,
+}
+
+/// Cold (rarely-read) stream fields relocated out of the hot `Stream` entry
+/// per ADR-004 to reduce per-stream rent.
+///
+/// The hot `Stream` struct keeps these fields for backward-compatible decode of
+/// legacy persisted streams; new writes store the authoritative values here
+/// under `DataKey::StreamCold(stream_id)` while the hot entry carries defaults.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct StreamColdData {
+    /// Remaining-deposit threshold for low-balance events; 0 disables them.
+    pub low_balance_threshold: i128,
+    /// Optional reason for pausing the stream (regulatory compliance and dispute resolution).
+    pub pause_reason: Option<soroban_sdk::String>,
 }
 
 /// Vesting terms stored separately so existing persisted `Stream` values remain decodable.
@@ -72,6 +111,50 @@ pub struct LinearVestSchedule {
     pub vest_period: u64,
     /// Optional duration before accrued vesting becomes claimable.
     pub cliff: Option<u64>,
+}
+
+/// A single milestone in a milestone-based vesting schedule (#446).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Milestone {
+    /// Ledger timestamp at which this milestone vests.
+    pub timestamp: u64,
+    /// Fraction of the grant that vests at this milestone, in basis points
+    /// (10000 = 100%). Fractions across all milestones must sum to 10000.
+    pub fraction_bps: u32,
+}
+
+/// Milestone-based vesting terms stored separately so existing persisted
+/// `Stream` values remain decodable (#446).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MilestoneSchedule {
+    /// Net grant amount available over the schedule.
+    pub total_grant: i128,
+    /// Optional cliff timestamp before which nothing vests.
+    pub cliff: Option<u64>,
+    /// Sorted (ascending by timestamp) list of milestones.
+    pub milestones: soroban_sdk::Vec<Milestone>,
+}
+
+/// A single entry in a forward rate schedule (#447).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RateScheduleEntry {
+    /// Ledger timestamp at which this rate becomes active.
+    pub timestamp: u64,
+    /// Payroll rate in tokens per second from this timestamp onward.
+    pub rate_per_second: i128,
+}
+
+/// Forward rate schedule stored separately so existing persisted `Stream`
+/// values remain decodable (#447). Entries are sorted ascending by timestamp
+/// with no gaps or overlaps.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RateSchedule {
+    /// Sorted (ascending by timestamp) list of rate changes.
+    pub entries: soroban_sdk::Vec<RateScheduleEntry>,
 }
 
 /// Parameters for a single stream in a batch create call.
@@ -142,6 +225,10 @@ pub struct PendingUpgrade {
 pub enum DataKey {
     /// Persisted stream data keyed by stream ID.
     Stream(u64),
+    /// Cold (rarely-read) stream fields keyed by stream ID (ADR-004).
+    /// Holds `StreamColdData`; the hot `Stream` entry carries defaults for these
+    /// fields so legacy persisted streams remain decodable.
+    StreamCold(u64),
     /// Number of streams created so far.
     StreamCount,
     /// Contract administrator address.
@@ -208,12 +295,20 @@ pub enum DataKey {
     LastCreateLedger(Address),
     /// Split stream beneficiaries: stream ID → Vec<SplitBeneficiary> for multi-recipient streams (PROD-22).
     SplitBeneficiaries(u64),
-    /// Whether the token allowlist is enforced on create_stream/create_linear_vest.
-    /// Missing key means the allowlist is disabled (permissive default).
-    TokenAllowlistEnabled,
-    /// Per-token allowlist entry: token address → bool. Only consulted when
-    /// `TokenAllowlistEnabled` is set to true.
-    TokenAllowlist(Address),
+    /// Version stamp for emitted contract events (SC-90). Stored in instance
+    /// storage as a `u32` so indexers can detect the event schema version
+    /// without a resync. Set on initialize/migrate.
+    ContractEventVersion,
+    /// Composite index: (employer address, token address) → Vec<u64> of stream
+    /// IDs funded by that employer with that token (SC-110). Backfilled by
+    /// `migrate` for legacy streams.
+    StreamsByEmployerAndToken(Address, Address),
+    /// Version of the index backfill performed by `migrate` (SC-94). Stored in
+    /// instance storage as a `u32`; gates idempotent index rebuilds.
+    MigrateVersion,
+    /// Cursor for the bounded, resumable index backfill in `migrate` (SC-94).
+    /// Holds the next stream ID to process; removed once backfill completes.
+    MigrateCursor,
     /// Structured stream metadata (e.g. department, cost center) for payroll
     /// categorization: stream ID → Map<Symbol, Symbol>. Stored apart from
     /// `Stream` so existing persisted streams stay decodable. See #467.
@@ -221,6 +316,13 @@ pub enum DataKey {
     /// Admin-configurable maximum batch size for batch entrypoints.
     /// Default: `MAX_BATCH_SIZE` (50). Bounded to 1..=200. See #483.
     MaxBatchSize,
+    /// Immutable/locked flag for a stream (#445): stream ID → bool. Stored
+    /// apart from `Stream` so existing persisted streams stay decodable.
+    StreamImmutable(u64),
+    /// Milestone vesting schedule for a stream (#446).
+    MilestoneSchedule(u64),
+    /// Forward rate schedule for a stream (#447).
+    RateSchedule(u64),
 }
 
 /// Contract error codes – panic messages reference these names so callers can
@@ -254,6 +356,7 @@ pub enum DataKey {
 /// | E025 | ERR_INVALID_AUTO_TOPUP  | Invalid auto top-up parameters                     |
 /// | E026 | ERR_NO_AUTO_TOPUP       | No auto top-up configured for the stream           |
 /// | E029 | ERR_BATCH_TOO_LARGE     | Batch contains more than 50 streams                |
+/// | E036 | ERR_EMPTY_UPDATES       | Batch threshold update list must not be empty      |
 /// Error returned when a payroll rate is zero.
 pub const ERR_ZERO_RATE: &str = "E001: rate_per_second must be greater than zero";
 /// Error returned when a deposit is not positive.
@@ -322,6 +425,16 @@ pub const ERR_CLIFF_AFTER_STOP: &str = "E035: cliff_time must be <= stop_time";
 /// Maximum number of streams in one batch call (create/cancel/pause/resume).
 pub const MAX_BATCH_SIZE: u32 = 50;
 
+/// Current version stamp for emitted contract events (SC-90). Written to
+/// instance storage under `DataKey::ContractEventVersion` on initialize and
+/// migrate so indexers can detect the event schema version.
+pub const CONTRACT_EVENT_VERSION: u32 = 1;
+
+/// Current version of the index backfill performed by `migrate` (SC-94).
+/// Written to instance storage under `DataKey::MigrateVersion`; used to gate
+/// idempotent index rebuilds for legacy streams.
+pub const MIGRATE_VERSION: u32 = 1;
+
 /// Lower bound for the admin-configurable maximum batch size (#483).
 pub const MIN_MAX_BATCH_SIZE: u32 = 1;
 
@@ -345,6 +458,25 @@ pub const ERR_METADATA_ENTRY_TOO_LONG: &str = "E037: metadata key or value excee
 
 /// E038: configured max batch size is outside the allowed bounds (#483).
 pub const ERR_INVALID_MAX_BATCH_SIZE: &str = "E038: max batch size out of bounds";
+
+/// E039: operation rejected because the stream is immutable (#445).
+pub const ERR_IMMUTABLE_STREAM: &str = "E039: stream is immutable";
+
+/// E040: milestone schedule is invalid (empty, unsorted, or fractions do not
+/// sum to 10000) (#446).
+pub const ERR_MILESTONE_SCHEDULE_INVALID: &str = "E040: invalid milestone schedule";
+
+/// E041: rate schedule is invalid (empty or contains non-positive rates) (#447).
+pub const ERR_RATE_SCHEDULE_INVALID: &str = "E041: invalid rate schedule";
+
+/// E042: rate schedule contains a gap between entries (#447).
+pub const ERR_RATE_SCHEDULE_GAP: &str = "E042: rate schedule contains a gap";
+
+/// E043: rate schedule contains overlapping or unsorted entries (#447).
+pub const ERR_RATE_SCHEDULE_OVERLAP: &str = "E043: rate schedule contains an overlap";
+
+/// E044: withdraw_to recipient is invalid (e.g. the contract itself) (#448).
+pub const ERR_WITHDRAW_TO_INVALID: &str = "E044: invalid withdraw_to recipient";
 
 /// E030: stop_time extends beyond 10-year limit from now
 pub const ERR_STOP_TIME_TOO_FAR: &str = "E030: stop_time must not exceed 10 years from now";
@@ -399,6 +531,9 @@ pub const ERR_INVALID_AUTO_TOPUP: &str = "E030: invalid auto top-up parameters";
 // Restored from ce6fe77 (dropped by a merge).
 /// `archive_stream` was called before `ARCHIVE_WAIT_PERIOD` elapsed.
 pub const ERR_ARCHIVE_TOO_EARLY: &str = "E031: archive waiting period has not elapsed";
+
+/// `withdraw_amount` was called with an amount greater than claimable (SC-81).
+pub const ERR_EXCEEDS_CLAIMABLE: &str = "E036: amount exceeds claimable balance";
 
 // Restored from 24db2de (dropped by a merge).
 /// Protocol fee configuration. Absent configuration means fees are disabled.
