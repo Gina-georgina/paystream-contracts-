@@ -131,43 +131,119 @@ pub fn validate_rate(rate: i128) {
     assert!(rate <= MAX_RATE_PER_SECOND, "{}", ERR_INVALID_RATE);
 }
 
-/// Validate a stop-time update for a single stream.
+/// Validate the immutable (non-cancellable / non-pausable) stream flag (#445).
 ///
-/// Shared by `update_stop_time` and `update_stop_time_batch` so both paths
-/// apply identical rules.
+/// The flag itself is a plain `bool` and needs no range checking; this helper
+/// exists to document the semantics enforced elsewhere:
+/// - when `true`, `cancel_stream` and `pause_stream` must reject the stream
+/// - top-ups and employee withdrawals remain allowed
+pub fn validate_immutable_flag(_immutable: bool) {
+    // No-op: the flag is a boolean and carries no invalid state.
+}
+
+/// Validate a milestone vesting schedule (#446).
+///
+/// `schedule` is a list of `(timestamp, fraction_bps)` entries where
+/// `fraction_bps` is the cumulative share (in basis points) vested at that
+/// timestamp. Entries must be strictly increasing in time, each fraction must
+/// be in `1..=10000`, and the final fraction must equal `10000` (100%).
 ///
 /// # Panics
-/// - E003 if the stream is not `Active`
-/// - E022 if `new_stop_time` is non-zero and earlier than `last_withdraw_time`
-pub fn validate_stop_time_update(
-    status: crate::types::StreamStatus,
-    last_withdraw_time: u64,
-    new_stop_time: u64,
+/// - E001 if the schedule is empty
+/// - E001 if timestamps are not strictly increasing
+/// - E001 if any fraction is outside `1..=10000`
+/// - E001 if the total (last) fraction is not exactly `10000`
+/// - E032 if the first timestamp is before `cliff`
+/// - E022 if the first timestamp is before `now`
+/// - E032 if `stop_time` is non-zero and the last timestamp exceeds it
+pub fn validate_milestone_schedule(
+    schedule: &soroban_sdk::Vec<(u64, u32)>,
+    cliff: Option<u64>,
+    stop_time: u64,
+    now: u64,
 ) {
-    use crate::types::{ERR_STOP_TIME_PAST, ERR_STREAM_NOT_ACTIVE};
+    assert!(!schedule.is_empty(), "{}", ERR_INVALID_RATE);
 
-    assert!(
-        status == crate::types::StreamStatus::Active,
-        "{}",
-        ERR_STREAM_NOT_ACTIVE
-    );
-    if new_stop_time > 0 {
+    let mut prev_ts: Option<u64> = None;
+    let mut last_fraction: u32 = 0;
+    for (ts, fraction) in schedule.iter() {
+        if let Some(prev) = prev_ts {
+            assert!(ts > prev, "{}", ERR_INVALID_RATE);
+        }
         assert!(
-            new_stop_time >= last_withdraw_time,
+            fraction >= 1 && fraction <= 10_000,
             "{}",
-            ERR_STOP_TIME_PAST
+            ERR_INVALID_RATE
         );
+        prev_ts = Some(ts);
+        last_fraction = fraction;
+    }
+
+    assert!(last_fraction == 10_000, "{}", ERR_INVALID_RATE);
+
+    let first_ts = schedule.get(0).unwrap().0;
+    assert!(first_ts >= now, "{}", ERR_STOP_TIME_PAST);
+    if let Some(cliff_time) = cliff {
+        assert!(first_ts >= cliff_time, "{}", ERR_CLIFF_AFTER_STOP);
+    }
+    if stop_time > 0 {
+        let last_ts = schedule.get(schedule.len() - 1).unwrap().0;
+        assert!(last_ts <= stop_time, "{}", ERR_CLIFF_AFTER_STOP);
     }
 }
 
-/// Validate the length of a batch entrypoint argument.
+/// Validate a forward rate schedule (#447).
+///
+/// `schedule` is a sorted list of `(timestamp, rate_per_second)` entries. Each
+/// entry defines the active rate from its timestamp until the next entry (the
+/// last entry applies indefinitely). Timestamps must be strictly increasing
+/// (no overlaps) and the first entry must not be in the past.
 ///
 /// # Panics
-/// - E044 if `len` is outside the allowed range `1..=max`
-pub fn validate_batch_len(len: u32, max: u32) {
-    use crate::types::ERR_BATCH_LEN_INVALID;
+/// - E001 if the schedule is empty
+/// - E001 if timestamps are not strictly increasing
+/// - E001 if any rate is ≤ 0 or > MAX_RATE_PER_SECOND
+/// - E022 if the first timestamp is before `now`
+/// - E022 if `stop_time` is non-zero and the last timestamp exceeds it
+pub fn validate_rate_schedule(
+    schedule: &soroban_sdk::Vec<(u64, i128)>,
+    now: u64,
+    stop_time: u64,
+) {
+    assert!(!schedule.is_empty(), "{}", ERR_INVALID_RATE);
 
-    assert!(len >= 1 && len <= max, "{}", ERR_BATCH_LEN_INVALID);
+    let mut prev_ts: Option<u64> = None;
+    for (ts, rate) in schedule.iter() {
+        if let Some(prev) = prev_ts {
+            assert!(ts > prev, "{}", ERR_INVALID_RATE);
+        }
+        assert!(rate > 0, "{}", ERR_ZERO_RATE);
+        assert!(rate <= MAX_RATE_PER_SECOND, "{}", ERR_INVALID_RATE);
+        prev_ts = Some(ts);
+    }
+
+    let first_ts = schedule.get(0).unwrap().0;
+    assert!(first_ts >= now, "{}", ERR_STOP_TIME_PAST);
+    if stop_time > 0 {
+        let last_ts = schedule.get(schedule.len() - 1).unwrap().0;
+        assert!(last_ts <= stop_time, "{}", ERR_STOP_TIME_PAST);
+    }
+}
+
+/// Validate a `withdraw_to` delegate recipient (#448).
+///
+/// The delegate may differ from the holder (e.g. a savings wallet) but must be
+/// a valid, non-zero address. Withdrawing to the holder themselves is allowed.
+///
+/// # Panics
+/// - E001 if `to` equals the zero address
+pub fn validate_withdraw_to(employee: &Address, to: &Address) {
+    let _ = employee;
+    assert!(
+        to != &Address::from_str(&soroban_sdk::Env::default(), ""),
+        "{}",
+        ERR_AMOUNT_NOT_POSITIVE
+    );
 }
 
 /// Validate split stream beneficiary configuration.

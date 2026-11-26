@@ -5873,6 +5873,57 @@ fn test_create_split_vest_rejects_bad_basis_points() {
     client.create_split_vest(&employer, &token_id, &100_000, &100, &None, &split);
 }
 
+// ---------------------------------------------------------------------------
+// SC-72: get_pending_upgrade query (#440)
+// ---------------------------------------------------------------------------
+
+/// Returns None when no upgrade has been proposed yet.
+#[test]
+fn test_get_pending_upgrade_none_initially() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let result = client.get_pending_upgrade();
+    assert!(result.is_none(), "expected None before any propose_upgrade");
+    env.as_contract(&client.address, || {
+        soroban_sdk::snapshot_writer::write(&env, "test_get_pending_upgrade_none_initially.1");
+    });
+}
+
+/// Returns Some((wasm_hash, unlock_time)) after propose_upgrade.
+#[test]
+fn test_get_pending_upgrade_some_after_propose() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let wasm_hash: soroban_sdk::BytesN<32> = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+    client.propose_upgrade(&wasm_hash, &0);
+
+    let result = client.get_pending_upgrade();
+    assert!(result.is_some(), "expected Some after propose_upgrade");
+    let (stored_hash, unlock_time) = result.unwrap();
+    assert_eq!(stored_hash, wasm_hash, "wasm_hash mismatch");
+    // ledger timestamp starts at 0; TIMELOCK_DELAY = 172800
+    assert_eq!(unlock_time, 172_800u64, "unlock_time mismatch");
+}
+
+/// Returns None after the upgrade proposal is cancelled.
+#[test]
+fn test_get_pending_upgrade_none_after_cancel() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let wasm_hash: soroban_sdk::BytesN<32> = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+    client.propose_upgrade(&wasm_hash, &0);
+    client.cancel_upgrade(&1);
+
+    let result = client.get_pending_upgrade();
+    assert!(result.is_none(), "expected None after cancel_upgrade");
+}
+
 /// Split vest withdraw distributes claimable per basis points.
 #[test]
 fn test_split_vest_withdraw_distributes_claimable() {
@@ -5895,4 +5946,563 @@ fn test_split_vest_withdraw_distributes_claimable() {
     assert_eq!(token.balance(&a), 30_000);
     assert_eq!(token.balance(&b), 20_000);
     assert_eq!(client.get_stream(&id).withdrawn, 50_000);
+}
+
+// ---------------------------------------------------------------------------
+// SC-77 (#445): immutable / locked streams
+// ---------------------------------------------------------------------------
+
+/// An immutable stream is flagged on creation and still accrues normally.
+#[test]
+fn test_immutable_stream_created_with_flag() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    let id = client.create_stream(
+        &employer,
+        &employee,
+        &token_id,
+        &10_000,
+        &10,
+        &0,
+        &None,
+        &None,
+        &true,
+    );
+
+    assert!(client.get_stream(&id).immutable);
+    env.ledger().with_mut(|l| l.timestamp += 100);
+    assert_eq!(client.claimable(&id), 1_000);
+}
+
+/// A regular stream is not immutable.
+#[test]
+fn test_non_immutable_stream_flag_defaults_false() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    let id = client.create_stream(&employer, &employee, &token_id, &10_000, &10, &0, &None, &None, &false);
+    assert!(!client.get_stream(&id).immutable);
+}
+
+/// cancel_stream rejects an immutable stream.
+#[test]
+#[should_panic(expected = "E045")]
+fn test_immutable_stream_cancel_rejected() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    let id = client.create_stream(
+        &employer,
+        &employee,
+        &token_id,
+        &10_000,
+        &10,
+        &0,
+        &None,
+        &None,
+        &true,
+    );
+
+    env.ledger().with_mut(|l| l.timestamp += 10);
+    client.cancel_stream(&employer, &id, &None);
+}
+
+/// pause_stream rejects an immutable stream.
+#[test]
+#[should_panic(expected = "E045")]
+fn test_immutable_stream_pause_rejected() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    let id = client.create_stream(
+        &employer,
+        &employee,
+        &token_id,
+        &10_000,
+        &10,
+        &0,
+        &None,
+        &None,
+        &true,
+    );
+
+    client.pause_stream(&employer, &id, &None);
+}
+
+/// cancel_streams_batch rejects a batch containing an immutable stream.
+#[test]
+#[should_panic(expected = "E045")]
+fn test_immutable_stream_cancel_batch_rejected() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    let id = client.create_stream(
+        &employer,
+        &employee,
+        &token_id,
+        &10_000,
+        &10,
+        &0,
+        &None,
+        &None,
+        &true,
+    );
+
+    let mut ids = soroban_sdk::Vec::new(&env);
+    ids.push_back(id);
+    client.cancel_streams_batch(&employer, &ids);
+}
+
+/// pause_stream_batch rejects a batch containing an immutable stream.
+#[test]
+#[should_panic(expected = "E045")]
+fn test_immutable_stream_pause_batch_rejected() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    let id = client.create_stream(
+        &employer,
+        &employee,
+        &token_id,
+        &10_000,
+        &10,
+        &0,
+        &None,
+        &None,
+        &true,
+    );
+
+    let mut ids = soroban_sdk::Vec::new(&env);
+    ids.push_back(id);
+    client.pause_stream_batch(&employer, &ids);
+}
+
+/// Immutable streams still accept top-ups and remain withdrawable.
+#[test]
+fn test_immutable_stream_top_up_and_withdraw_succeed() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+    let token = paystream_token::TokenContractClient::new(&env, &token_id);
+
+    client.initialize(&admin);
+    let id = client.create_stream(
+        &employer,
+        &employee,
+        &token_id,
+        &10_000,
+        &10,
+        &0,
+        &None,
+        &None,
+        &true,
+    );
+
+    client.top_up(&employer, &id, &5_000);
+    assert_eq!(client.get_stream(&id).deposit, 15_000);
+
+    env.ledger().with_mut(|l| l.timestamp += 100);
+    client.withdraw(&employee, &id);
+    assert_eq!(token.balance(&employee), 1_000);
+    assert_eq!(client.get_stream(&id).withdrawn, 1_000);
+    assert!(client.get_stream(&id).immutable);
+}
+
+// ---------------------------------------------------------------------------
+// SC-78 (#446): milestone-based vesting
+// ---------------------------------------------------------------------------
+
+fn milestone_schedule(
+    env: &Env,
+    entries: &[(u64, u32)],
+) -> soroban_sdk::Vec<crate::types::Milestone> {
+    let mut v = soroban_sdk::Vec::new(env);
+    for (ts, bps) in entries.iter() {
+        v.push_back(crate::types::Milestone {
+            timestamp: *ts,
+            basis_points: *bps,
+        });
+    }
+    v
+}
+
+/// Nothing is claimable before the first milestone.
+#[test]
+fn test_milestone_nothing_before_first_milestone() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let schedule = milestone_schedule(&env, &[(1_500, 2_500), (2_000, 5_000)]);
+    let id = client.create_milestone_vest(&employer, &employee, &token_id, &100_000, &schedule, &None);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_499);
+    assert_eq!(client.claimable(&id), 0);
+}
+
+/// Claimable equals the vested fraction exactly at each milestone boundary.
+#[test]
+fn test_milestone_boundaries() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let schedule = milestone_schedule(&env, &[(1_500, 2_500), (2_000, 5_000), (3_000, 10_000)]);
+    let id = client.create_milestone_vest(&employer, &employee, &token_id, &100_000, &schedule, &None);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_500);
+    assert_eq!(client.claimable(&id), 25_000);
+    env.ledger().with_mut(|l| l.timestamp = 1_999);
+    assert_eq!(client.claimable(&id), 25_000);
+    env.ledger().with_mut(|l| l.timestamp = 2_000);
+    assert_eq!(client.claimable(&id), 50_000);
+    env.ledger().with_mut(|l| l.timestamp = 3_000);
+    assert_eq!(client.claimable(&id), 100_000);
+}
+
+/// A cliff delays all milestone vesting until it passes.
+#[test]
+fn test_milestone_cliff_delays_vesting() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let schedule = milestone_schedule(&env, &[(1_500, 2_500), (2_000, 5_000)]);
+    let id =
+        client.create_milestone_vest(&employer, &employee, &token_id, &100_000, &schedule, &Some(1_800));
+
+    env.ledger().with_mut(|l| l.timestamp = 1_700);
+    assert_eq!(client.claimable(&id), 0);
+    env.ledger().with_mut(|l| l.timestamp = 1_800);
+    assert_eq!(client.claimable(&id), 25_000);
+    env.ledger().with_mut(|l| l.timestamp = 2_000);
+    assert_eq!(client.claimable(&id), 50_000);
+}
+
+/// Partial claims decrement the remaining claimable amount.
+#[test]
+fn test_milestone_partial_claims() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+    let token = paystream_token::TokenContractClient::new(&env, &token_id);
+
+    client.initialize(&admin);
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let schedule = milestone_schedule(&env, &[(1_500, 2_500), (2_000, 5_000)]);
+    let id = client.create_milestone_vest(&employer, &employee, &token_id, &100_000, &schedule, &None);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_500);
+    client.withdraw(&employee, &id);
+    assert_eq!(token.balance(&employee), 25_000);
+    assert_eq!(client.claimable(&id), 0);
+
+    env.ledger().with_mut(|l| l.timestamp = 2_000);
+    assert_eq!(client.claimable(&id), 25_000);
+    client.withdraw(&employee, &id);
+    assert_eq!(token.balance(&employee), 50_000);
+    assert_eq!(client.get_stream(&id).withdrawn, 50_000);
+}
+
+/// Milestone fractions must be strictly increasing and end at 10_000 bps.
+#[test]
+#[should_panic(expected = "E046")]
+fn test_milestone_schedule_must_end_at_full_vest() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let schedule = milestone_schedule(&env, &[(1_500, 2_500), (2_000, 5_000)]);
+    client.create_milestone_vest(&employer, &employee, &token_id, &100_000, &schedule, &None);
+}
+
+/// Milestone timestamps must be strictly increasing.
+#[test]
+#[should_panic(expected = "E046")]
+fn test_milestone_schedule_must_be_sorted() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let schedule = milestone_schedule(&env, &[(2_000, 5_000), (1_500, 10_000)]);
+    client.create_milestone_vest(&employer, &employee, &token_id, &100_000, &schedule, &None);
+}
+
+// ---------------------------------------------------------------------------
+// SC-79 (#447): dynamic rate schedule
+// ---------------------------------------------------------------------------
+
+fn rate_schedule(env: &Env, entries: &[(u64, i128)]) -> soroban_sdk::Vec<(u64, i128)> {
+    let mut v = soroban_sdk::Vec::new(env);
+    for (ts, rate) in entries.iter() {
+        v.push_back((*ts, *rate));
+    }
+    v
+}
+
+/// Rate changes auto-apply at the configured timestamps.
+#[test]
+fn test_rate_schedule_mid_schedule_withdraw() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+    let token = paystream_token::TokenContractClient::new(&env, &token_id);
+
+    client.initialize(&admin);
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let schedule = rate_schedule(&env, &[(1_100, 10), (1_200, 20)]);
+    let id = client.create_stream_with_rate_schedule(
+        &employer,
+        &employee,
+        &token_id,
+        &100_000,
+        &1,
+        &0,
+        &None,
+        &None,
+        &schedule,
+    );
+
+    // 100s at 1/s + 100s at 10/s + 100s at 20/s
+    env.ledger().with_mut(|l| l.timestamp = 1_300);
+    assert_eq!(client.claimable(&id), 3_100);
+
+    client.withdraw(&employee, &id);
+    assert_eq!(token.balance(&employee), 3_100);
+    assert_eq!(client.get_stream(&id).withdrawn, 3_100);
+}
+
+/// An unsorted rate schedule is rejected.
+#[test]
+#[should_panic(expected = "E047")]
+fn test_rate_schedule_unsorted_rejected() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let schedule = rate_schedule(&env, &[(1_200, 10), (1_100, 20)]);
+    client.create_stream_with_rate_schedule(
+        &employer,
+        &employee,
+        &token_id,
+        &100_000,
+        &1,
+        &0,
+        &None,
+        &None,
+        &schedule,
+    );
+}
+
+/// A schedule entry in the past (gap before the first entry) is rejected.
+#[test]
+#[should_panic(expected = "E047")]
+fn test_rate_schedule_past_timestamp_rejected() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let schedule = rate_schedule(&env, &[(900, 10)]);
+    client.create_stream_with_rate_schedule(
+        &employer,
+        &employee,
+        &token_id,
+        &100_000,
+        &1,
+        &0,
+        &None,
+        &None,
+        &schedule,
+    );
+}
+
+/// Duplicate timestamps (overlap) are rejected.
+#[test]
+#[should_panic(expected = "E047")]
+fn test_rate_schedule_overlap_rejected() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let schedule = rate_schedule(&env, &[(1_100, 10), (1_100, 20)]);
+    client.create_stream_with_rate_schedule(
+        &employer,
+        &employee,
+        &token_id,
+        &100_000,
+        &1,
+        &0,
+        &None,
+        &None,
+        &schedule,
+    );
+}
+
+/// A negative rate in the schedule is rejected.
+#[test]
+#[should_panic(expected = "E047")]
+fn test_rate_schedule_negative_rate_rejected() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let schedule = rate_schedule(&env, &[(1_100, -1)]);
+    client.create_stream_with_rate_schedule(
+        &employer,
+        &employee,
+        &token_id,
+        &100_000,
+        &1,
+        &0,
+        &None,
+        &None,
+        &schedule,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SC-80 (#448): withdraw_to delegate recipient
+// ---------------------------------------------------------------------------
+
+/// withdraw_to sends tokens to the delegate and decrements the holder's claimable.
+#[test]
+fn test_withdraw_to_delegates_tokens() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let savings = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+    let token = paystream_token::TokenContractClient::new(&env, &token_id);
+
+    client.initialize(&admin);
+    let id = client.create_stream(&employer, &employee, &token_id, &10_000, &10, &0, &None, &None, &false);
+
+    env.ledger().with_mut(|l| l.timestamp += 100);
+    assert_eq!(client.claimable(&id), 1_000);
+
+    client.withdraw_to(&employee, &id, &savings);
+
+    assert_eq!(token.balance(&savings), 1_000);
+    assert_eq!(token.balance(&employee), 0);
+    assert_eq!(client.claimable(&id), 0);
+    assert_eq!(client.get_stream(&id).withdrawn, 1_000);
+}
+
+/// withdraw_to emits an event carrying the delegate recipient.
+#[test]
+fn test_withdraw_to_emits_event() {
+    use soroban_sdk::{symbol_short, vec, IntoVal};
+
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let savings = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    let id = client.create_stream(&employer, &employee, &token_id, &10_000, &10, &0, &None, &None, &false);
+
+    env.ledger().with_mut(|l| l.timestamp += 100);
+    client.withdraw_to(&employee, &id, &savings);
+
+    let events = crate::test::all_events(&env);
+    let topics = vec![
+        &env,
+        symbol_short!("v1").into_val(&env),
+        symbol_short!("withdraw_to").into_val(&env),
+        id.into_val(&env),
+    ];
+    assert!(events.iter().any(|(_, t, _)| t == topics));
+}
+
+/// withdraw_to requires the holder's auth; a third party cannot redirect funds.
+#[test]
+fn test_withdraw_to_requires_holder_auth() {
+    let env = Env::default();
+    let id = env.register(StreamContract, ());
+    let client = StreamContractClient::new(&env, &id);
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    let savings = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    let stream_id =
+        client.create_stream(&employer, &employee, &token_id, &10_000, &10, &0, &None, &None, &false);
+
+    env.ledger().with_mut(|l| l.timestamp += 100);
+    // No mock_all_auths: the attacker has not signed for the employee.
+    let res = client.try_withdraw_to(&attacker, &stream_id, &savings);
+    assert!(res.is_err(), "withdraw_to must require the holder's auth");
 }

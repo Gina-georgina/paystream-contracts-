@@ -8,12 +8,14 @@ Indexer-facing record of event schema changes. **Process:** any PR that adds, re
 
 Each entry lists the event, the change (added field / renamed topic / removed field) and migration steps for indexers.
 
-### v1.2 (2026-10-11) — proportional fee refund and batched stop-time updates
+### v1.2 (2026-10-11) — delegate withdrawals, schedules and immutable streams
 
 | Event | Change | Migration |
 |-------|--------|-----------|
-| `cancelled` | Added field `fee_refund` (i128) at data[2] | Treat missing `fee_refund` as `0` for events emitted before v1.2 |
-| `stop_upd` | Now also emitted once per stream by `update_stop_time_batch` (topic `["v1", "stop_upd", <stream_id>]`, data `[stop_time]`); payload unchanged | No change needed; indexers already handling `stop_upd` will see additional emissions |
+| `withdraw_to` | Added event `["v1", "withdraw_to", <stream_id>]` with data `[employee, to, amount]` | Indexers tracking withdrawals should also handle `withdraw_to`; the holder's claimable decrements exactly as with `withdraw` |
+| `rate_schedule_set` | Added event `["v1", "rate_sched", <stream_id>]` with data `[schedule]` (`Vec<(u64, i128)>`) | Indexers may ignore this event; the active rate still advances via `rate_upd` at each scheduled timestamp |
+| `milestone_schedule_set` | Added event `["v1", "ms_sched", <stream_id>]` with data `[schedule]` (`Vec<(u64, u32)>`, fractions in basis points) | Indexers may ignore this event; claimable amounts are derived from the schedule |
+| `stream_immutable` | Added event `["v1", "immutable", <stream_id>]` with data `[immutable]` (`bool`) | Indexers should treat streams with `immutable == true` as non-cancellable and non-pausable |
 
 ### v1.1 (2026-10-04) — stream metadata and split vest streams
 
@@ -110,6 +112,92 @@ Emitted when an employee withdraws tokens from a stream.
 {
   "topic": ["v1", "withdraw", 1],
   "data": ["GEFGH...", 500000]
+}
+```
+
+---
+
+### withdraw_to
+
+Emitted when the receipt holder withdraws tokens directly to a different
+recipient address (#448). The holder's claimable decrements exactly as with
+`withdraw`; the tokens are transferred to `to`.
+
+**Topic**: `["v1", "withdraw_to", <stream_id>]`
+
+**Data**:
+- `employee` (Address): The receipt holder authorizing the withdrawal
+- `to` (Address): The recipient of the withdrawn tokens
+- `amount` (i128): Amount withdrawn
+
+**Example**:
+```json
+{
+  "topic": ["v1", "withdraw_to", 1],
+  "data": ["GEFGH...", "GSVGS...", 500000]
+}
+```
+
+---
+
+### rate_schedule_set
+
+Emitted when a forward rate schedule is set on a stream via
+`create_stream` / `update_rate_schedule` (#447). The schedule is sorted by
+timestamp and validated for gaps/overlaps.
+
+**Topic**: `["v1", "rate_sched", <stream_id>]`
+
+**Data**:
+- `schedule` (Vec<(u64, i128)>): Sorted `(timestamp, rate_per_second)` pairs
+
+**Example**:
+```json
+{
+  "topic": ["v1", "rate_sched", 1],
+  "data": [[1767225600, 1000000], [1769904000, 2000000]]
+}
+```
+
+---
+
+### milestone_schedule_set
+
+Emitted when a milestone vesting schedule is set on a stream (#446). Each
+entry vests a fraction of the total at the given timestamp.
+
+**Topic**: `["v1", "ms_sched", <stream_id>]`
+
+**Data**:
+- `schedule` (Vec<(u64, u32)>): Sorted `(timestamp, fraction_bps)` pairs;
+  fractions are in basis points (0–10000) and sum to at most 10000
+
+**Example**:
+```json
+{
+  "topic": ["v1", "ms_sched", 1],
+  "data": [[1767225600, 2500], [1782864000, 5000]]
+}
+```
+
+---
+
+### stream_immutable
+
+Emitted when a stream is created with the immutable flag (#445). Immutable
+streams cannot be cancelled or paused by the employer; funds remain
+withdrawable by the employee and top-ups are still allowed.
+
+**Topic**: `["v1", "immutable", <stream_id>]`
+
+**Data**:
+- `immutable` (bool): `true` when the stream is locked against cancel/pause
+
+**Example**:
+```json
+{
+  "topic": ["v1", "immutable", 1],
+  "data": true
 }
 ```
 
@@ -413,6 +501,8 @@ Emitted when a pending contract upgrade is cancelled.
 | bool | Boolean | `true` or `false` |
 | BytesN<32> | Fixed 32-byte array | `abcd1234...` |
 | StreamStatus enum | Stream status (0-3) | `0`, `1`, `2`, or `3` |
+| Vec<(u64, i128)> | Sorted timestamp/rate pairs | `[[1767225600, 1000000]]` |
+| Vec<(u64, u32)> | Sorted timestamp/fraction (bps) pairs | `[[1767225600, 2500]]` |
 
 ## Indexer Compatibility Guide
 
@@ -473,6 +563,8 @@ function parseV1Event(topic, data) {
 
 | Version | Date | Changes |
 |---------|------|---------|
+| v1.1 | 2026-10-04 | Added `metadata_updated`, `split_vest_created` |
+| v1.2 | 2026-10-11 | Added `withdraw_to`, `rate_schedule_set`, `milestone_schedule_set`, `stream_immutable` |
 | v1 | 2026-09-27 | Initial schema version |
 
 ## Testing
