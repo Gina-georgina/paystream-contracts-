@@ -67,6 +67,25 @@ pub struct Stream {
     pub immutable: bool,
 }
 
+/// Lightweight projection of a stream for indexers polling many streams.
+///
+/// Contains only the fields needed to display status and balances, avoiding
+/// the cost of returning the full [`Stream`] struct. See #424.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct StreamSummary {
+    /// Unique sequential stream identifier.
+    pub id: u64,
+    /// Current lifecycle state.
+    pub status: StreamStatus,
+    /// Tokens currently claimable by the employee.
+    pub claimable: i128,
+    /// Tokens still remaining in the stream's deposit.
+    pub remaining: i128,
+    /// Payroll rate in tokens per second; zero for linear vest streams.
+    pub rate: i128,
+}
+
 /// Vesting terms stored separately so existing persisted `Stream` values remain decodable.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
