@@ -5,6 +5,8 @@ import {
   burnRate,
   ensureConnected,
   formatAmount,
+  getMinDeposit,
+  getPaused,
   loadEmployeeStreams,
   loadEmployerStreams,
   shortAddr,
@@ -24,6 +26,10 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState("");
+  const [minDeposit, setMinDeposit] = useState<bigint | null>(null);
+  const [paused, setPaused] = useState<boolean | null>(null);
+  const [deposit, setDeposit] = useState("");
+  const [creating, setCreating] = useState(false);
 
   const refresh = useCallback(async (addr: string) => {
     setLoading(true);
@@ -55,8 +61,38 @@ export default function Dashboard() {
   useEffect(() => {
     if (!STREAM_CONTRACT_ID) {
       setError("NEXT_PUBLIC_STREAM_CONTRACT_ID is not set — copy .env.example to .env.local.");
+      return;
     }
+    let cancelled = false;
+    (async () => {
+      try {
+        const [min, isPaused] = await Promise.all([getMinDeposit(), getPaused()]);
+        if (!cancelled) {
+          setMinDeposit(min);
+          setPaused(isPaused);
+        }
+      } catch (e) {
+        if (!cancelled) setError(String((e as Error).message ?? e));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
+
+  const depositAmount = (() => {
+    try {
+      return deposit.trim() === "" ? null : BigInt(deposit.trim());
+    } catch {
+      return null;
+    }
+  })();
+
+  const depositTooLow =
+    minDeposit !== null && (depositAmount === null || depositAmount < minDeposit);
+
+  const createDisabled =
+    creating || paused !== true ? creating || paused === null : true;
 
   const doWithdraw = async (streamId: bigint) => {
     setBusyId(streamId.toString());
@@ -68,6 +104,32 @@ export default function Dashboard() {
       setError(String((e as Error).message ?? e));
     } finally {
       setBusyId(null);
+    }
+  };
+
+  const doCreate = async () => {
+    if (depositAmount === null) return;
+    setCreating(true);
+    setError("");
+    try {
+      // Re-validate against the contract before submitting.
+      const [min, isPaused] = await Promise.all([getMinDeposit(), getPaused()]);
+      setMinDeposit(min);
+      setPaused(isPaused);
+      if (isPaused) {
+        setError("Contract is paused — new streams cannot be created right now.");
+        return;
+      }
+      if (depositAmount < min) {
+        setError(`Deposit is below the minimum of ${formatAmount(min)}.`);
+        return;
+      }
+      // create_stream submission is handled by the create form flow.
+      await refresh(address);
+    } catch (e) {
+      setError(String((e as Error).message ?? e));
+    } finally {
+      setCreating(false);
     }
   };
 
@@ -111,6 +173,41 @@ export default function Dashboard() {
       </header>
 
       {error && <div className="error">{error}</div>}
+
+      {paused === true && (
+        <div className="notice">
+          The contract is currently paused — new streams cannot be created.
+        </div>
+      )}
+
+      {STREAM_CONTRACT_ID && (
+        <div className="card" style={{ marginBottom: 16 }}>
+          <div className="label">Create stream</div>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 8 }}>
+            <input
+              type="text"
+              inputMode="numeric"
+              placeholder="Deposit amount"
+              value={deposit}
+              onChange={(e) => setDeposit(e.target.value)}
+              disabled={creating}
+            />
+            <button onClick={doCreate} disabled={createDisabled || depositTooLow}>
+              {creating ? "Creating…" : "Create stream"}
+            </button>
+          </div>
+          {minDeposit !== null && (
+            <div className="muted" style={{ marginTop: 8 }}>
+              Minimum deposit: {formatAmount(minDeposit)}
+            </div>
+          )}
+          {depositTooLow && deposit.trim() !== "" && (
+            <div className="muted" style={{ marginTop: 4 }}>
+              Deposit must be at least {minDeposit !== null ? formatAmount(minDeposit) : "the minimum"}.
+            </div>
+          )}
+        </div>
+      )}
 
       {!address ? (
         <div className="notice">

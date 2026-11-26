@@ -3,6 +3,43 @@
   "contract": "stream",
   "functions": [
     {
+      "name": "create_stream",
+      "description": "Create a vesting stream. Supports linear, milestone, and dynamic rate schedules. The immutable flag makes the stream non-cancellable and non-pausable by the employer while funds remain withdrawable by the employee.",
+      "params": [
+        { "name": "sender", "type": "Address" },
+        { "name": "recipient", "type": "Address" },
+        { "name": "token", "type": "Address" },
+        { "name": "total_amount", "type": "i128" },
+        { "name": "start_time", "type": "u64" },
+        { "name": "cliff_time", "type": "u64" },
+        { "name": "end_time", "type": "u64" },
+        { "name": "immutable", "type": "bool" },
+        { "name": "milestone_schedule", "type": "Vec<(u64, u32)>" },
+        { "name": "rate_schedule", "type": "Vec<(u64, i128)>" }
+      ],
+      "returns": "u64"
+    },
+    {
+      "name": "withdraw_to",
+      "description": "Withdraw claimable tokens for a stream directly to a delegate recipient address. Requires auth from the receipt holder; the holder's claimable amount is decremented and the delegate receives the tokens.",
+      "params": [
+        { "name": "employee", "type": "Address" },
+        { "name": "stream_id", "type": "u64" },
+        { "name": "to", "type": "Address" }
+      ],
+      "returns": "i128"
+    },
+    {
+      "name": "set_rate_schedule",
+      "description": "Set a forward schedule of (timestamp, rate) so rate changes auto-apply at configured times. The schedule must be sorted with no gaps or overlaps.",
+      "params": [
+        { "name": "sender", "type": "Address" },
+        { "name": "stream_id", "type": "u64" },
+        { "name": "rate_schedule", "type": "Vec<(u64, i128)>" }
+      ],
+      "returns": "()"
+    },
+    {
       "name": "create_split_vest",
       "description": "Create a linear vest stream whose claimable amount is split among multiple beneficiaries.",
       "params": [
@@ -46,39 +83,73 @@
       "returns": "()"
     },
     {
-      "name": "streams_expiring_before",
-      "description": "Keeper query returning a bounded set of stream IDs with stop_time <= timestamp, sourced from the StreamsByTimestamp index. Read-only.",
+      "name": "update_stop_time_batch",
+      "description": "Batched variant of update_stop_time for employers managing many streams. Accepts 1..=50 updates, applies update_stop_time validation per stream, and is all-or-nothing.",
       "params": [
-        { "name": "timestamp", "type": "u64" }
+        { "name": "employer", "type": "Address" },
+        { "name": "updates", "type": "Vec<(u64, u64)>" }
       ],
-      "returns": "Vec<u64>"
+      "returns": "()"
     },
     {
-      "name": "total_claimable_by_employee",
-      "description": "Read-only aggregate of claimable amounts across an employee's active streams. Bounded iteration; errors past the limit.",
-      "params": [
-        { "name": "employee", "type": "Address" }
-      ],
+      "name": "get_min_deposit",
+      "description": "Read-only query returning the configured minimum deposit amount.",
+      "params": [],
       "returns": "i128"
     },
     {
-      "name": "total_locked_by_employer",
-      "description": "Read-only aggregate of remaining deposit (deposit - withdrawn) across an employer's active streams. Bounded iteration.",
-      "params": [
-        { "name": "employer", "type": "Address" }
-      ],
-      "returns": "i128"
+      "name": "get_paused",
+      "description": "Read-only query returning whether the contract is paused.",
+      "params": [],
+      "returns": "bool"
     },
     {
-      "name": "stream_summary",
-      "description": "Lightweight summary of a stream (id, status, claimable, remaining, rate) for cheap polling instead of the full Stream struct.",
-      "params": [
-        { "name": "stream_id", "type": "u64" }
-      ],
-      "returns": "StreamSummary"
+      "name": "get_admin",
+      "description": "Read-only query returning the current admin address.",
+      "params": [],
+      "returns": "Address"
+    },
+    {
+      "name": "get_pending_admin",
+      "description": "Read-only query returning the pending admin address, if any.",
+      "params": [],
+      "returns": "Option<Address>"
     }
   ],
   "events": [
+    {
+      "name": "withdraw_to",
+      "description": "Emitted when a receipt holder withdraws claimable tokens to a delegate recipient.",
+      "fields": [
+        { "name": "stream_id", "type": "u64" },
+        { "name": "employee", "type": "Address" },
+        { "name": "to", "type": "Address" },
+        { "name": "amount", "type": "i128" }
+      ]
+    },
+    {
+      "name": "rate_schedule_set",
+      "description": "Emitted when a dynamic rate schedule is configured for a stream.",
+      "fields": [
+        { "name": "stream_id", "type": "u64" },
+        { "name": "rate_schedule", "type": "Vec<(u64, i128)>" }
+      ]
+    },
+    {
+      "name": "milestone_schedule_set",
+      "description": "Emitted when a milestone vesting schedule is configured for a stream.",
+      "fields": [
+        { "name": "stream_id", "type": "u64" },
+        { "name": "milestone_schedule", "type": "Vec<(u64, u32)>" }
+      ]
+    },
+    {
+      "name": "stream_immutable",
+      "description": "Emitted when a stream is created with the immutable flag set.",
+      "fields": [
+        { "name": "stream_id", "type": "u64" }
+      ]
+    },
     {
       "name": "stream_metadata_updated",
       "description": "Emitted when a stream's structured metadata map is updated.",
@@ -92,6 +163,14 @@
       "description": "Emitted when the admin-configurable max batch size is changed.",
       "fields": [
         { "name": "max", "type": "u32" }
+      ]
+    },
+    {
+      "name": "stream_cancelled",
+      "description": "Emitted when a stream is cancelled, including the proportional protocol fee refunded to the employer.",
+      "fields": [
+        { "name": "stream_id", "type": "u64" },
+        { "name": "fee_refund", "type": "i128" }
       ]
     }
   ]
