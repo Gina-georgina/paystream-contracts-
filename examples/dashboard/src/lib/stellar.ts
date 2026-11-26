@@ -4,7 +4,6 @@
 
 import {
   Contract,
-  Networks,
   TransactionBuilder,
   nativeToScVal,
   rpc,
@@ -14,14 +13,18 @@ import {
 } from "@stellar/stellar-sdk";
 import {
   getAddress,
+  getNetwork,
   isConnected,
   requestAccess,
   signTransaction,
 } from "@stellar/freighter-api";
+import {
+  NETWORK_PASSPHRASE,
+  RPC_URL,
+  STREAM_CONTRACT_ID,
+} from "./network";
 
-const RPC_URL = process.env.NEXT_PUBLIC_RPC_URL || "https://soroban-testnet.stellar.org";
-export const STREAM_CONTRACT_ID = process.env.NEXT_PUBLIC_STREAM_CONTRACT_ID || "";
-export const NETWORK_PASSPHRASE = Networks.TESTNET;
+export { NETWORK_PASSPHRASE, STREAM_CONTRACT_ID };
 
 export const server = new rpc.Server(RPC_URL);
 // Built lazily: `new Contract("")` throws, and this module is also evaluated
@@ -130,9 +133,23 @@ export async function loadEmployerStreams(employer: string): Promise<StreamRow[]
   return hydrate(employer, ids);
 }
 
-/** Fetch every stream paying `employee`, chunked 50 at a time, with claimable amounts. */
+/** Fetch every stream paying `employee`, paginated 50 at a time, with claimable amounts. */
 export async function loadEmployeeStreams(employee: string): Promise<StreamRow[]> {
-  const ids: bigint[] = ((await read(employee, "streams_by_employee", addr(employee))) as bigint[]) || [];
+  const ids: bigint[] = [];
+  let startAfter = 0n;
+  for (;;) {
+    const page: bigint[] =
+      ((await read(
+        employee,
+        "streams_by_employee_paginated",
+        addr(employee),
+        u64(startAfter),
+        nativeToScVal(50, { type: "u32" }),
+      )) as bigint[]) || [];
+    if (page.length === 0) break;
+    ids.push(...page);
+    startAfter = page[page.length - 1];
+  }
   return hydrate(employee, ids);
 }
 
@@ -176,6 +193,16 @@ export const withdraw = (employee: string, streamId: bigint) =>
 export const withdrawAll = (employee: string) =>
   invoke("withdraw_all", addr(employee)) as Promise<[bigint, bigint][]>;
 
+/** Read the contract's minimum deposit (base units) for validating new streams. */
+export async function getMinDeposit(source: string): Promise<bigint> {
+  return (await read(source, "get_min_deposit")) as bigint;
+}
+
+/** Read whether the contract is paused; new streams should be blocked when true. */
+export async function getPaused(source: string): Promise<boolean> {
+  return (await read(source, "get_paused")) as boolean;
+}
+
 // --- Wallet + formatting helpers ---
 
 export async function ensureConnected(): Promise<string> {
@@ -185,6 +212,37 @@ export async function ensureConnected(): Promise<string> {
   }
   const { address } = await getAddress();
   return address;
+}
+
+/**
+ * Non-prompting wallet check for restoring a persisted session on load.
+ * Never calls requestAccess(), so it cannot trigger a Freighter popup.
+ * Returns the connected address, or null if the wallet is unavailable.
+ */
+export async function checkWalletConnection(): Promise<string | null> {
+  try {
+    const { isConnected: connected } = await isConnected();
+    if (!connected) return null;
+    const { address, error } = await getAddress();
+    if (error || !address) return null;
+    return address;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Non-prompting network check: compares the wallet's active network
+ * passphrase against the one this app is configured for.
+ */
+export async function checkWalletNetwork(): Promise<boolean> {
+  try {
+    const { networkPassphrase, error } = await getNetwork();
+    if (error || !networkPassphrase) return false;
+    return networkPassphrase === NETWORK_PASSPHRASE;
+  } catch {
+    return false;
+  }
 }
 
 /** Format a base-unit amount for a 7-decimal Stellar asset. */
