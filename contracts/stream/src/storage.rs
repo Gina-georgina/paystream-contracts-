@@ -15,6 +15,9 @@ pub const MAX_MAX_BATCH_SIZE: u32 = 200;
 /// Maximum number of entries allowed in a stream's metadata map.
 pub const MAX_METADATA_ENTRIES: u32 = 8;
 
+/// Maximum number of stream IDs accepted by `withdraw_batch`.
+pub const MAX_WITHDRAW_BATCH_SIZE: u32 = 50;
+
 /// Error returned when a metadata map exceeds `MAX_METADATA_ENTRIES`.
 pub const ERR_METADATA_TOO_LARGE: u32 = 0x1003;
 
@@ -26,6 +29,9 @@ pub const ERR_DRAIN_TIMELOCK_ACTIVE: u32 = 0x1001;
 
 /// Error returned when a WASM upgrade would downgrade or re-apply the current version.
 pub const ERR_VERSION_DOWNGRADE: u32 = 0x1002;
+
+/// Error returned when `withdraw_batch` is called with an empty or oversized ID list.
+pub const ERR_WITHDRAW_BATCH_SIZE: u32 = 0x1005;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -302,6 +308,67 @@ pub fn assert_version_upgrade(env: &Env, new_version: u32) {
     }
 }
 
+/// Cached view of a stream's cliff/schedule configuration.
+///
+/// Reading the cliff and schedule from storage is the dominant cost of
+/// `claimable_amount`. This struct lets callers load those values once and
+/// reuse them across repeated accrual computations (e.g. inside
+/// `withdraw_all`), guaranteeing at most one storage read per call.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScheduleCache {
+    pub cliff_time: u64,
+    pub start_time: u64,
+    pub end_time: u64,
+    pub total_amount: i128,
+}
+
+impl ScheduleCache {
+    /// Loads the cliff/schedule fields for `stream_id` exactly once.
+    ///
+    /// Returns `None` when the stream does not exist, matching the behavior of
+    /// the underlying storage lookups.
+    pub fn load(env: &Env, stream_id: u64) -> Option<Self> {
+        let stream: Option<crate::Stream> = env
+            .storage()
+            .persistent()
+            .get(&crate::DataKey::Stream(stream_id));
+        stream.map(|s| ScheduleCache {
+            cliff_time: s.cliff_time,
+            start_time: s.start_time,
+            end_time: s.end_time,
+            total_amount: s.total_amount,
+        })
+    }
+
+    /// Computes the claimable amount for `now` using the cached schedule,
+    /// performing no additional storage reads.
+    pub fn claimable_amount(&self, now: u64, withdrawn: i128) -> i128 {
+        if now < self.cliff_time || now < self.start_time {
+            return 0;
+        }
+        let elapsed = now.saturating_sub(self.start_time);
+        let duration = self.end_time.saturating_sub(self.start_time);
+        let vested = if duration == 0 || now >= self.end_time {
+            self.total_amount
+        } else {
+            self.total_amount
+                .saturating_mul(elapsed as i128)
+                / (duration as i128)
+        };
+        vested.saturating_sub(withdrawn).max(0)
+    }
+}
+
+/// Validates the size of a `withdraw_batch` ID list.
+///
+/// Panics with `ERR_WITHDRAW_BATCH_SIZE` when `len` is 0 or exceeds
+/// `MAX_WITHDRAW_BATCH_SIZE` (1..=50).
+pub fn assert_withdraw_batch_size(len: u32) {
+    if len == 0 || len > MAX_WITHDRAW_BATCH_SIZE {
+        panic!("{}", ERR_WITHDRAW_BATCH_SIZE);
+    }
+}
+
 #[cfg(test)]
 mod version_tests {
     use super::*;
@@ -328,6 +395,24 @@ mod version_tests {
         let env = Env::default();
         env.storage().instance().set(&crate::DataKey::Version, &2u32);
         assert_version_upgrade(&env, 3);
+    }
+
+    #[test]
+    fn withdraw_batch_size_accepts_valid_range() {
+        assert_withdraw_batch_size(1);
+        assert_withdraw_batch_size(MAX_WITHDRAW_BATCH_SIZE);
+    }
+
+    #[test]
+    #[should_panic]
+    fn withdraw_batch_size_rejects_empty() {
+        assert_withdraw_batch_size(0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn withdraw_batch_size_rejects_oversized() {
+        assert_withdraw_batch_size(MAX_WITHDRAW_BATCH_SIZE + 1);
     }
 }
 
